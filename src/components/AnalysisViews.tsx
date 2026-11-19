@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import type {
   AnalysisPipelineStage,
+  AudioEffectItem,
   AudioTrackMix,
   NavPage,
   ReelProject,
@@ -476,6 +477,7 @@ interface AudioAnalysisViewProps {
   currentTimeSec: number;
   onSeek: (timeSec: number) => void;
   onUpdateTracks: (tracks: AudioTrackMix[]) => void;
+  onUpdateAudioEffect: (effectId: string, patch: Partial<AudioEffectItem>) => void;
 }
 
 export const AudioAnalysisView: React.FC<AudioAnalysisViewProps> = ({
@@ -483,10 +485,16 @@ export const AudioAnalysisView: React.FC<AudioAnalysisViewProps> = ({
   currentTimeSec,
   onSeek,
   onUpdateTracks,
+  onUpdateAudioEffect,
 }) => {
   const { audio } = project;
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
   const [replacingTrackId, setReplacingTrackId] = useState<'A2' | 'A3' | 'A4' | null>(null);
+
+  const audioEffects = audio.audioEffects ?? [];
+  const freeAudioEffects = audioEffects.filter((ef) => ef.licenseTier === 'Free / Built-in');
+  const paidAudioEffects = audioEffects.filter((ef) => ef.licenseTier === 'Paid / Third-Party');
+  const sp = audio.spectralProfile;
 
   const updateTrack = (id: AudioTrackMix['id'], patch: Partial<AudioTrackMix>) => {
     onUpdateTracks(audio.tracks.map((t) => (t.id === id ? { ...t, ...patch } : t)));
@@ -614,6 +622,195 @@ export const AudioAnalysisView: React.FC<AudioAnalysisViewProps> = ({
             </button>
           ))}
         </div>
+      </section>
+
+      {/* Deep Spectral & Dynamics Telemetry */}
+      {sp && (
+        <section className="rounded-xl bg-[#13151B] border border-white/[0.08] p-6 space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-[15px] font-semibold text-white">
+                Spectral Balance & Dynamics Telemetry
+              </h2>
+              <p className="text-[12px] text-[#8E96AC]">
+                Measured directly from decoded PCM samples to automatically configure Premiere Pro EQ,
+                compression, limiting, reverb, and stereo filters.
+              </p>
+            </div>
+            <span className="text-[12px] font-mono tabular-nums text-[#9B82FF]">
+              Reverb Tail: {sp.reverbTailEstimate}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-6 space-y-3">
+              {[
+                { label: 'Sub-Bass (<80 Hz)', value: sp.subBassEnergy, color: 'bg-[#7C5CFF]' },
+                { label: 'Bass (80–250 Hz)', value: sp.bassEnergy, color: 'bg-[#3B82F6]' },
+                { label: 'Midrange (250 Hz–4 kHz)', value: sp.midEnergy, color: 'bg-[#38BDF8]' },
+                { label: 'Highs / Air (4 kHz+)', value: sp.highEnergy, color: 'bg-[#4ADE80]' },
+              ].map((band) => (
+                <div key={band.label} className="space-y-1">
+                  <div className="flex items-center justify-between text-[12px]">
+                    <span className="text-[#C6CBD9]">{band.label}</span>
+                    <span className="font-mono tabular-nums text-white">{band.value}%</span>
+                  </div>
+                  <div className="h-2 rounded-full bg-[#0C0D11] overflow-hidden">
+                    <div
+                      className={`h-full ${band.color} rounded-full`}
+                      style={{ width: `${Math.min(100, Math.max(2, band.value))}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="lg:col-span-6 grid grid-cols-2 sm:grid-cols-3 gap-3 text-[12px]">
+              <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+                <div className="text-[#7F869B]">Integrated RMS</div>
+                <div className="text-[16px] font-mono tabular-nums font-semibold text-white mt-0.5">
+                  {sp.integratedRmsDb} dBFS
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+                <div className="text-[#7F869B]">True Peak</div>
+                <div className="text-[16px] font-mono tabular-nums font-semibold text-white mt-0.5">
+                  {sp.peakDb} dBFS
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+                <div className="text-[#7F869B]">Dynamic Range</div>
+                <div className="text-[16px] font-mono tabular-nums font-semibold text-[#38BDF8] mt-0.5">
+                  {sp.dynamicRangeDb} dB
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+                <div className="text-[#7F869B]">Stereo Width</div>
+                <div className="text-[16px] font-mono tabular-nums font-semibold text-white mt-0.5">
+                  {sp.stereoWidthPercent}%
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+                <div className="text-[#7F869B]">Low-Pass Filter</div>
+                <div className="text-[14px] font-medium text-white mt-1">
+                  {sp.lowPassFilterDetected ? 'Detected' : 'Full Spectrum'}
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+                <div className="text-[#7F869B]">Ducking / Comp</div>
+                <div className="text-[14px] font-medium text-white mt-1">
+                  {sp.sidechainOrDuckingDetected ? 'Active Pumping' : 'Natural'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Detected Audio Effects (Free Built-in Included vs Paid Plugins Skipped) */}
+      <section className="rounded-xl bg-[#13151B] border border-white/[0.08] p-6 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-[15px] font-semibold text-white">
+              Reconstructed Audio Effects (Premiere Pro Track Filters)
+            </h2>
+            <p className="text-[12px] text-[#8E96AC]">
+              All Free / Built-in Premiere Pro audio effects are automatically added to Track A1 in
+              XMEML. Paid third-party audio plugins are safely skipped without interrupting export.
+            </p>
+          </div>
+          <span className="text-[12px] font-mono tabular-nums text-[#4ADE80]">
+            {freeAudioEffects.filter((e) => e.includedInTimeline).length} Free FX Active
+            {paidAudioEffects.length > 0 ? ` · ${paidAudioEffects.length} Paid Skipped` : ''}
+          </span>
+        </div>
+
+        {freeAudioEffects.length === 0 ? (
+          <div className="p-4 rounded-lg bg-[#0C0D11] border border-white/[0.06] text-[13px] text-[#7F869B]">
+            No additional audio filters required beyond standard track volume & fades.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {freeAudioEffects.map((afx) => (
+              <div
+                key={afx.id}
+                className={`p-4 rounded-lg border space-y-3 transition-colors ${
+                  afx.includedInTimeline
+                    ? 'bg-[#0C0D11] border-white/[0.08]'
+                    : 'bg-[#0C0D11]/50 border-white/[0.04] opacity-60'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[14px] font-semibold text-white truncate">{afx.name}</div>
+                    <div className="text-[11px] font-mono tabular-nums text-[#8E96AC] mt-0.5">
+                      {afx.premiereEffectName} · Track {afx.trackId} · {afx.category} ·{' '}
+                      {afx.detectionSource || 'Web Audio DSP'}
+                    </div>
+                  </div>
+                  <label className="inline-flex items-center gap-1.5 text-[11px] text-[#4ADE80] shrink-0 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={afx.includedInTimeline}
+                      onChange={(e) =>
+                        onUpdateAudioEffect(afx.id, { includedInTimeline: e.target.checked })
+                      }
+                      className="w-3.5 h-3.5 accent-[#7C5CFF]"
+                    />
+                    <span>{afx.includedInTimeline ? 'Added' : 'Muted'}</span>
+                  </label>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[12px]">
+                    <span className="text-[#8E96AC]">Filter Intensity</span>
+                    <span className="font-mono tabular-nums text-white">{afx.intensity}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={afx.intensity}
+                    onChange={(e) =>
+                      onUpdateAudioEffect(afx.id, { intensity: Number(e.target.value) })
+                    }
+                    className="w-full"
+                  />
+                </div>
+
+                <div className="text-[12px] text-[#A5ACBF] leading-relaxed">{afx.notes}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {paidAudioEffects.length > 0 && (
+          <div className="pt-4 border-t border-white/[0.08] space-y-3">
+            <div className="flex items-center gap-2 text-[13px] font-medium text-[#FBBF24]">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>Skipped Paid / Third-Party Audio Plugins ({paidAudioEffects.length})</span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {paidAudioEffects.map((afx) => (
+                <div
+                  key={afx.id}
+                  className="p-3.5 rounded-lg bg-[#19150E] border border-[#D97706]/35 space-y-1 text-[12px]"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-white">{afx.name}</span>
+                    <span className="font-mono text-[#FBBF24] shrink-0">Paid · Skipped</span>
+                  </div>
+                  <div className="text-[#8E96AC] font-mono">
+                    Vendor: {afx.pluginVendor || 'Third-Party'} · Track {afx.trackId}
+                  </div>
+                  <p className="text-[#D4D8E3] leading-relaxed">
+                    {afx.skippedReason || afx.notes}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Multitrack Audio Mixer & Replacement Controls */}

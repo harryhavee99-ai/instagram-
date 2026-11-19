@@ -1,5 +1,12 @@
 import JSZip from 'jszip';
-import type { ColorGradeSettings, MotionGraphicItem, ReelProject } from '../types/project';
+import type {
+  AudioEffectItem,
+  ColorGradeSettings,
+  EffectItem,
+  MotionGraphicItem,
+  ReelProject,
+} from '../types/project';
+import { generateSrtSubtitles, hexToRgba } from './captionPresets';
 import { clamp, formatTimecodeMs } from './formatters';
 
 function escapeXml(value: string): string {
@@ -17,6 +24,337 @@ function toFrames(seconds: number, timebase: number): number {
 
 function sanitizeFileName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'Reel2Premiere_Project';
+}
+
+function buildVideoEffectFilterXml(ef: EffectItem): string {
+  if (!ef.includedInTimeline || ef.licenseTier !== 'Free / Built-in') return '';
+  const effId = ef.premiereEffectId || 'AE.ADBE Geometry2';
+  const effName = escapeXml(ef.premiereEffectName || ef.name);
+  const intensity = clamp(ef.intensity, 0, 100);
+
+  if (effId === 'Gaussian Blur' || /gaussian|blur/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>${effName}</name>
+                  <effectid>Gaussian Blur</effectid>
+                  <effectcategory>Blur</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>radius</parameterid>
+                    <name>Blurriness</name>
+                    <valuemin>0</valuemin>
+                    <valuemax>200</valuemax>
+                    <value>${Math.round(intensity * 0.6)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  if (/sharpen/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>Sharpen</name>
+                  <effectid>AE.ADBE Sharpen</effectid>
+                  <effectcategory>Blur &amp; Sharpen</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>amount</parameterid>
+                    <name>Sharpen Amount</name>
+                    <valuemin>0</valuemin>
+                    <valuemax>200</valuemax>
+                    <value>${Math.round(intensity * 0.5)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  if (/noise/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>Noise</name>
+                  <effectid>AE.ADBE Noise</effectid>
+                  <effectcategory>Noise &amp; Grain</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>amount</parameterid>
+                    <name>Amount of Noise</name>
+                    <valuemin>0</valuemin>
+                    <valuemax>100</valuemax>
+                    <value>${Math.round(intensity * 0.3)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  if (/brightness/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>Brightness &amp; Contrast</name>
+                  <effectid>AE.ADBE Brightness &amp; Contrast 2</effectid>
+                  <effectcategory>Color Correction</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>brightness</parameterid>
+                    <name>Brightness</name>
+                    <valuemin>-150</valuemin>
+                    <valuemax>150</valuemax>
+                    <value>${Math.round(intensity * 0.45)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  if (/chromatic/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>VR Chromatic Aberrations</name>
+                  <effectid>AE.ADBE VR Chromatic Aberrations</effectid>
+                  <effectcategory>Immersive Video</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>aberrationred</parameterid>
+                    <name>Aberration (Red)</name>
+                    <valuemin>-20</valuemin>
+                    <valuemax>20</valuemax>
+                    <value>${(intensity * 0.08).toFixed(2)}</value>
+                  </parameter>
+                  <parameter>
+                    <parameterid>aberrationblue</parameterid>
+                    <name>Aberration (Blue)</name>
+                    <valuemin>-20</valuemin>
+                    <valuemax>20</valuemax>
+                    <value>${(-intensity * 0.08).toFixed(2)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  if (/lumetri/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>${effName}</name>
+                  <effectid>AE.ADBE Lumetri</effectid>
+                  <effectcategory>Color Correction</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>vignetteamount</parameterid>
+                    <name>Vignette Amount</name>
+                    <valuemin>-5</valuemin>
+                    <valuemax>5</valuemax>
+                    <value>${(-intensity * 0.04).toFixed(2)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  if (/crop/i.test(effId)) {
+    return `
+              <filter>
+                <effect>
+                  <name>Crop</name>
+                  <effectid>AE.ADBE Crop</effectid>
+                  <effectcategory>Transform</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>top</parameterid>
+                    <name>Top</name>
+                    <valuemin>0</valuemin>
+                    <valuemax>100</valuemax>
+                    <value>${Math.round(intensity * 0.12)}</value>
+                  </parameter>
+                  <parameter>
+                    <parameterid>bottom</parameterid>
+                    <name>Bottom</name>
+                    <valuemin>0</valuemin>
+                    <valuemax>100</valuemax>
+                    <value>${Math.round(intensity * 0.12)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+  }
+
+  // Generic free/built-in Premiere video filter block (Transform, Tint, Mirror, Wave Warp, etc.)
+  return `
+              <filter>
+                <effect>
+                  <name>${effName}</name>
+                  <effectid>${escapeXml(effId)}</effectid>
+                  <effectcategory>${escapeXml(ef.category)}</effectcategory>
+                  <effecttype>filter</effecttype>
+                  <mediatype>video</mediatype>
+                  <parameter>
+                    <parameterid>amount</parameterid>
+                    <name>Amount</name>
+                    <valuemin>0</valuemin>
+                    <valuemax>100</valuemax>
+                    <value>${intensity.toFixed(1)}</value>
+                  </parameter>
+                </effect>
+              </filter>`;
+}
+
+function buildAudioEffectFilterXml(afx: AudioEffectItem): string {
+  if (!afx.includedInTimeline || afx.licenseTier !== 'Free / Built-in') return '';
+  // Fade/automation is already encoded via audiolevels keyframes
+  if (afx.premiereEffectId === 'audiolevels') return '';
+
+  const effId = escapeXml(afx.premiereEffectId || 'ParametricEqualizer');
+  const effName = escapeXml(afx.premiereEffectName || afx.name);
+  const intensity = clamp(afx.intensity, 0, 100);
+
+  if (afx.premiereEffectId === 'Lowpass') {
+    const cutoffHz = Math.round(4500 - intensity * 30);
+    return `
+                <filter>
+                  <effect>
+                    <name>Lowpass</name>
+                    <effectid>Lowpass</effectid>
+                    <effectcategory>Filter and EQ</effectcategory>
+                    <effecttype>filter</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>cutoff</parameterid>
+                      <name>Cutoff</name>
+                      <valuemin>20</valuemin>
+                      <valuemax>20000</valuemax>
+                      <value>${clamp(cutoffHz, 400, 18000)}</value>
+                    </parameter>
+                  </effect>
+                </filter>`;
+  }
+
+  if (afx.premiereEffectId === 'Highpass') {
+    const cutoffHz = Math.round(60 + intensity * 3.5);
+    return `
+                <filter>
+                  <effect>
+                    <name>Highpass</name>
+                    <effectid>Highpass</effectid>
+                    <effectcategory>Filter and EQ</effectcategory>
+                    <effecttype>filter</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>cutoff</parameterid>
+                      <name>Cutoff</name>
+                      <valuemin>20</valuemin>
+                      <valuemax>20000</valuemax>
+                      <value>${clamp(cutoffHz, 40, 2000)}</value>
+                    </parameter>
+                  </effect>
+                </filter>`;
+  }
+
+  if (afx.premiereEffectId === 'StudioReverb') {
+    return `
+                <filter>
+                  <effect>
+                    <name>Studio Reverb</name>
+                    <effectid>StudioReverb</effectid>
+                    <effectcategory>Reverb</effectcategory>
+                    <effecttype>filter</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>wet</parameterid>
+                      <name>Wet Output Level</name>
+                      <valuemin>0</valuemin>
+                      <valuemax>100</valuemax>
+                      <value>${Math.round(intensity * 0.55)}</value>
+                    </parameter>
+                    <parameter>
+                      <parameterid>decay</parameterid>
+                      <name>Decay (ms)</name>
+                      <valuemin>100</valuemin>
+                      <valuemax>10000</valuemax>
+                      <value>${Math.round(600 + intensity * 24)}</value>
+                    </parameter>
+                  </effect>
+                </filter>`;
+  }
+
+  if (afx.premiereEffectId === 'HardLimiter') {
+    return `
+                <filter>
+                  <effect>
+                    <name>Hard Limiter</name>
+                    <effectid>HardLimiter</effectid>
+                    <effectcategory>Amplitude and Compression</effectcategory>
+                    <effecttype>filter</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>maxamplitude</parameterid>
+                      <name>Maximum Amplitude (dB)</name>
+                      <valuemin>-20</valuemin>
+                      <valuemax>0</valuemax>
+                      <value>-1.0</value>
+                    </parameter>
+                    <parameter>
+                      <parameterid>inputboost</parameterid>
+                      <name>Input Boost (dB)</name>
+                      <valuemin>0</valuemin>
+                      <valuemax>18</valuemax>
+                      <value>${(intensity * 0.06).toFixed(1)}</value>
+                    </parameter>
+                  </effect>
+                </filter>`;
+  }
+
+  if (afx.premiereEffectId === 'SingleBandCompressor') {
+    return `
+                <filter>
+                  <effect>
+                    <name>Single-band Compressor</name>
+                    <effectid>SingleBandCompressor</effectid>
+                    <effectcategory>Amplitude and Compression</effectcategory>
+                    <effecttype>filter</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>threshold</parameterid>
+                      <name>Threshold (dB)</name>
+                      <valuemin>-60</valuemin>
+                      <valuemax>0</valuemax>
+                      <value>${Math.round(-10 - intensity * 0.16)}</value>
+                    </parameter>
+                    <parameter>
+                      <parameterid>ratio</parameterid>
+                      <name>Ratio</name>
+                      <valuemin>1</valuemin>
+                      <valuemax>20</valuemax>
+                      <value>${(1.8 + intensity * 0.04).toFixed(1)}</value>
+                    </parameter>
+                  </effect>
+                </filter>`;
+  }
+
+  return `
+                <filter>
+                  <effect>
+                    <name>${effName}</name>
+                    <effectid>${effId}</effectid>
+                    <effectcategory>${escapeXml(afx.category)}</effectcategory>
+                    <effecttype>filter</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>amount</parameterid>
+                      <name>Intensity</name>
+                      <valuemin>0</valuemin>
+                      <valuemax>100</valuemax>
+                      <value>${intensity.toFixed(1)}</value>
+                    </parameter>
+                  </effect>
+                </filter>`;
 }
 
 /**
@@ -123,28 +461,25 @@ export function generatePremiereXmeml(
               </filter>`
         : '';
 
-    const shotBlurEffect = project.effects.find(
-      (ef) => ef.shotId === shot.id && ef.category === 'Blur'
-    );
-    const blurFilterXml = shotBlurEffect
-      ? `
-              <filter>
-                <effect>
-                  <name>Gaussian Blur</name>
-                  <effectid>Gaussian Blur</effectid>
-                  <effectcategory>Blur</effectcategory>
-                  <effecttype>filter</effecttype>
-                  <mediatype>video</mediatype>
-                  <parameter>
-                    <parameterid>radius</parameterid>
-                    <name>Blurriness</name>
-                    <valuemin>0</valuemin>
-                    <valuemax>200</valuemax>
-                    <value>${Math.round(shotBlurEffect.intensity * 0.6)}</value>
-                  </parameter>
-                </effect>
-              </filter>`
-      : '';
+    // Collect ALL included Free / Built-in video effects overlapping this shot (strictly skipping Paid plugins)
+    const matchingFreeEffects = project.effects.filter((ef) => {
+      if (!ef.includedInTimeline || ef.licenseTier !== 'Free / Built-in') return false;
+      if (ef.shotId) return ef.shotId === shot.id;
+      const overlaps = ef.startTimeSec < shot.endTimeSec && ef.endTimeSec > shot.startTimeSec;
+      return overlaps;
+    });
+
+    // Deduplicate identical effect IDs on a single clip
+    const seenVideoFilterIds = new Set<string>();
+    const freeVideoFiltersXml = matchingFreeEffects
+      .filter((ef) => {
+        const key = `${ef.premiereEffectId || ef.premiereEffectName}`;
+        if (seenVideoFilterIds.has(key)) return false;
+        seenVideoFilterIds.add(key);
+        return true;
+      })
+      .map((ef) => buildVideoEffectFilterXml(ef))
+      .join('');
 
     const fileRefXml = definedMasterFile
       ? `\n            <file id="master-source-file-1"/>`
@@ -210,9 +545,9 @@ export function generatePremiereXmeml(
                   <value>${shot.opacity.toFixed(1)}</value>
                 </parameter>
               </effect>
-            </filter>${speedFilterXml}${blurFilterXml}
+            </filter>${speedFilterXml}${freeVideoFiltersXml}
             <comments>
-              <mastercomment1>${escapeXml(`${shot.shotType} | ${shot.cameraMovement} | Confidence: ${shot.confidence}`)}</mastercomment1>
+              <mastercomment1>${escapeXml(`${shot.shotType} | ${shot.cameraMovement} | Free FX: ${seenVideoFilterIds.size} | Confidence: ${shot.confidence}`)}</mastercomment1>
             </comments>
           </clipitem>`);
 
@@ -250,12 +585,114 @@ export function generatePremiereXmeml(
     }
   });
 
-  // Build Video Track 3 (Editable SVG/Graphic title plates)
+  const buildGraphicAnimationFiltersXml = (gfx: MotionGraphicItem, durF: number): string => {
+    const animF = Math.max(2, Math.min(durF - 1, toFrames(gfx.animationDurationSec || 0.28, timebase)));
+    const midF = Math.max(1, Math.round(animF * 0.65));
+    const blocks: string[] = [];
+
+    if (gfx.animationType === 'Bounce Pop') {
+      blocks.push(`
+            <filter>
+              <effect>
+                <name>Basic Motion</name>
+                <effectid>basic</effectid>
+                <effectcategory>motion</effectcategory>
+                <effecttype>motion</effecttype>
+                <mediatype>video</mediatype>
+                <parameter>
+                  <parameterid>scale</parameterid>
+                  <name>Scale</name>
+                  <valuemin>0</valuemin>
+                  <valuemax>1000</valuemax>
+                  <value>100</value>
+                  <keyframe><when>0</when><value>68</value></keyframe>
+                  <keyframe><when>${midF}</when><value>112</value></keyframe>
+                  <keyframe><when>${animF}</when><value>100</value></keyframe>
+                </parameter>
+              </effect>
+            </filter>`);
+    } else if (
+      gfx.animationType === 'Pop In' ||
+      gfx.animationType === 'Kinetic Scale' ||
+      gfx.animationType === 'Word Highlight' ||
+      gfx.animationType === 'Karaoke Sweep'
+    ) {
+      blocks.push(`
+            <filter>
+              <effect>
+                <name>Basic Motion</name>
+                <effectid>basic</effectid>
+                <effectcategory>motion</effectcategory>
+                <effecttype>motion</effecttype>
+                <mediatype>video</mediatype>
+                <parameter>
+                  <parameterid>scale</parameterid>
+                  <name>Scale</name>
+                  <valuemin>0</valuemin>
+                  <valuemax>1000</valuemax>
+                  <value>100</value>
+                  <keyframe><when>0</when><value>82</value></keyframe>
+                  <keyframe><when>${animF}</when><value>100</value></keyframe>
+                </parameter>
+              </effect>
+            </filter>`);
+    } else if (gfx.animationType === 'Slide Up') {
+      blocks.push(`
+            <filter>
+              <effect>
+                <name>Basic Motion</name>
+                <effectid>basic</effectid>
+                <effectcategory>motion</effectcategory>
+                <effecttype>motion</effecttype>
+                <mediatype>video</mediatype>
+                <parameter>
+                  <parameterid>center</parameterid>
+                  <name>Center</name>
+                  <value><horiz>0</horiz><vert>0</vert></value>
+                  <keyframe><when>0</when><value><horiz>0</horiz><vert>0.035</vert></value></keyframe>
+                  <keyframe><when>${animF}</when><value><horiz>0</horiz><vert>0</vert></value></keyframe>
+                </parameter>
+              </effect>
+            </filter>`);
+    }
+
+    if (
+      gfx.animationType === 'Fade' ||
+      gfx.animationType === 'Slide Up' ||
+      gfx.animationType === 'Glow Pulse'
+    ) {
+      blocks.push(`
+            <filter>
+              <effect>
+                <name>Opacity</name>
+                <effectid>opacity</effectid>
+                <effectcategory>motion</effectcategory>
+                <effecttype>motion</effecttype>
+                <mediatype>video</mediatype>
+                <parameter>
+                  <parameterid>opacity</parameterid>
+                  <name>opacity</name>
+                  <valuemin>0</valuemin>
+                  <valuemax>100</valuemax>
+                  <value>100</value>
+                  <keyframe><when>0</when><value>0</value></keyframe>
+                  <keyframe><when>${animF}</when><value>100</value></keyframe>
+                </parameter>
+              </effect>
+            </filter>`);
+    }
+
+    return blocks.join('');
+  };
+
+  // Build Video Track 3 (Editable SVG/Graphic caption & title plates with keyframed animations)
   const v3Items = project.motionGraphics.map((gfx, idx) => {
     const startF = toFrames(gfx.startTimeSec, timebase);
     const endF = Math.max(startF + 2, toFrames(gfx.endTimeSec, timebase));
     const durF = endF - startF;
-    const gfxFileName = `Title_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
+    const prefix = gfx.isCaption || gfx.type === 'Caption' || gfx.type === 'Subtitle' ? 'Caption' : 'Title';
+    const gfxFileName = `${prefix}_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
+    const animFilters = buildGraphicAnimationFiltersXml(gfx, durF);
 
     return `
           <clipitem id="v3-gfx-${idx + 1}">
@@ -286,9 +723,9 @@ export function generatePremiereXmeml(
                   </samplecharacteristics>
                 </video>
               </media>
-            </file>
+            </file>${animFilters}
             <comments>
-              <mastercomment1>${escapeXml(`OCR ${gfx.type} | Font: ${gfx.fontFamily} ${gfx.fontSize}px | Anim: ${gfx.animationType}`)}</mastercomment1>
+              <mastercomment1>${escapeXml(`${gfx.type} | Preset: ${gfx.captionStylePreset || 'Custom'} | Font: ${gfx.fontFamily} ${gfx.fontSize}px | Anim: ${gfx.animationType}${gfx.spellChecked ? ' | Spellcheck Verified' : ''}`)}</mastercomment1>
             </comments>
           </clipitem>`;
   });
@@ -317,6 +754,22 @@ export function generatePremiereXmeml(
       </marker>`);
   });
 
+  // Add markers for timed Free / Built-in Audio Effects
+  (project.audio.audioEffects ?? [])
+    .filter((afx) => afx.includedInTimeline && afx.licenseTier === 'Free / Built-in')
+    .forEach((afx) => {
+      if (afx.startTimeSec > 0.25 || afx.endTimeSec < project.metadata.durationSec - 0.5) {
+        const f = toFrames(afx.startTimeSec, timebase);
+        markersXml.push(`
+      <marker>
+        <name>${escapeXml(`Audio FX: ${afx.premiereEffectName}`)}</name>
+        <comment>${escapeXml(`${afx.name} (${afx.category}) — ${afx.notes}`)}</comment>
+        <in>${f}</in>
+        <out>-1</out>
+      </marker>`);
+      }
+    });
+
   const a1Track = project.audio.tracks.find((t) => t.id === 'A1');
   const a1GainLinear = a1Track ? Math.pow(10, a1Track.volumeDb / 20) : 1;
   const fadeInFrames = a1Track ? toFrames(a1Track.fadeInSec, timebase) : 0;
@@ -335,6 +788,19 @@ export function generatePremiereXmeml(
       `\n                    <keyframe><when>${totalFrames}</when><value>0.000</value></keyframe>`
     );
   }
+
+  // Embed ALL included Free / Built-in Premiere Audio Effects onto Track A1 (strictly skipping Paid plugins)
+  const seenAudioFilterIds = new Set<string>();
+  const freeAudioFiltersXml = (project.audio.audioEffects ?? [])
+    .filter((afx) => {
+      if (!afx.includedInTimeline || afx.licenseTier !== 'Free / Built-in') return false;
+      if (afx.premiereEffectId === 'audiolevels') return false;
+      if (seenAudioFilterIds.has(afx.premiereEffectId)) return false;
+      seenAudioFilterIds.add(afx.premiereEffectId);
+      return true;
+    })
+    .map((afx) => buildAudioEffectFilterXml(afx))
+    .join('');
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE xmeml>
@@ -433,7 +899,7 @@ export function generatePremiereXmeml(
                       <value>${a1GainLinear.toFixed(3)}</value>${audioFadeKeyframes.join('')}
                     </parameter>
                   </effect>
-                </filter>
+                </filter>${freeAudioFiltersXml}
               </clipitem>
               <enabled>${a1Track?.muted ? 'FALSE' : 'TRUE'}</enabled>
               <locked>FALSE</locked>
@@ -543,15 +1009,64 @@ export function generateGraphicSvgPlate(
 ): string {
   const x = Math.round((gfx.positionXPercent / 100) * width);
   const y = Math.round((gfx.positionYPercent / 100) * height);
-  const scaledSize = Math.round(gfx.fontSize * (width / 540));
+  const scaleFactor = width / 540;
+  const scaledSize = Math.round(gfx.fontSize * scaleFactor);
+  const strokeWidth = Math.max(0, Number(((gfx.outlineWidthPx ?? 2) * scaleFactor * 0.75).toFixed(1)));
+
+  const rawText = gfx.text.replace(/\s+/g, ' ').trim();
+  const displayText =
+    gfx.textTransform === 'uppercase'
+      ? rawText.toUpperCase()
+      : gfx.textTransform === 'capitalize'
+      ? rawText.replace(/\b\w/g, (c) => c.toUpperCase())
+      : rawText;
+
+  const isNeon = gfx.captionStylePreset === 'Neon Glow' || gfx.animationType === 'Glow Pulse';
+  const filterAttr = isNeon
+    ? 'filter="url(#neonGlow)"'
+    : gfx.hasShadow
+    ? 'filter="url(#dropShadow)"'
+    : '';
+
+  const bgOpacity = gfx.backgroundOpacity ?? 0;
+  const estBoxWidth = Math.min(
+    Math.round(width * 0.88),
+    Math.max(Math.round(scaledSize * 3), Math.round(displayText.length * scaledSize * 0.62 + scaledSize * 1.1))
+  );
+  const estBoxHeight = Math.round(scaledSize * 1.55);
+  const bgRect =
+    bgOpacity > 0
+      ? `\n  <rect x="${Math.round(x - estBoxWidth / 2)}" y="${Math.round(y - estBoxHeight / 2)}" width="${estBoxWidth}" height="${estBoxHeight}" rx="${Math.round(scaledSize * 0.35)}" fill="${escapeXml(hexToRgba(gfx.backgroundColorHex || '#000000', bgOpacity))}" />`
+      : '';
+
+  // Highlight keyword via <tspan> if present
+  let innerTextXml = escapeXml(displayText);
+  const hlWord = gfx.highlightWord?.trim();
+  if (hlWord && gfx.highlightColorHex) {
+    const tokens = displayText.split(/(\s+)/);
+    const normHl = hlWord.toLowerCase().replace(/[^a-z0-9]/gi, '');
+    innerTextXml = tokens
+      .map((tok) => {
+        const cleanTok = tok.toLowerCase().replace(/[^a-z0-9]/gi, '');
+        if (normHl && cleanTok === normHl) {
+          return `<tspan fill="${escapeXml(gfx.highlightColorHex!)}">${escapeXml(tok)}</tspan>`;
+        }
+        return escapeXml(tok);
+      })
+      .join('');
+  }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
   <defs>
     <filter id="dropShadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.65"/>
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-color="#000000" flood-opacity="0.7"/>
     </filter>
-  </defs>
+    <filter id="neonGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="0" stdDeviation="12" flood-color="${escapeXml(gfx.outlineColorHex || '#7C5CFF')}" flood-opacity="0.95"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="24" flood-color="${escapeXml(gfx.highlightColorHex || '#38BDF8')}" flood-opacity="0.65"/>
+    </filter>
+  </defs>${bgRect}
   <text
     x="${x}"
     y="${y}"
@@ -562,10 +1077,11 @@ export function generateGraphicSvgPlate(
     font-weight="${gfx.fontWeight}"
     fill="${escapeXml(gfx.colorHex)}"
     stroke="${escapeXml(gfx.outlineColorHex)}"
-    stroke-width="2"
+    stroke-width="${strokeWidth}"
+    stroke-linejoin="round"
     paint-order="stroke"
-    ${gfx.hasShadow ? 'filter="url(#dropShadow)"' : ''}
-  >${escapeXml(gfx.text)}</text>
+    ${filterAttr}
+  >${innerTextXml}</text>
 </svg>`;
 }
 
@@ -598,6 +1114,77 @@ export function generateReconstructionReportMarkdown(project: ReelProject): stri
     );
   }
 
+  const includedFreeVideoFx = project.effects.filter(
+    (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+  );
+  const skippedPaidVideoFx = project.effects.filter((e) => e.licenseTier === 'Paid / Third-Party');
+  const includedFreeAudioFx = (project.audio.audioEffects ?? []).filter(
+    (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+  );
+  const skippedPaidAudioFx = (project.audio.audioEffects ?? []).filter(
+    (e) => e.licenseTier === 'Paid / Third-Party'
+  );
+
+  lines.push(
+    `## Included Free / Built-in Video Effects (${includedFreeVideoFx.length})`,
+    ``,
+    ...(includedFreeVideoFx.length
+      ? includedFreeVideoFx.map(
+          (ef) =>
+            `- **${ef.name}** → \`${ef.premiereEffectName}\` (${formatTimecodeMs(ef.startTimeSec)}–${formatTimecodeMs(ef.endTimeSec)}, Intensity ${ef.intensity}%)`
+        )
+      : ['- Standard Basic Motion & Opacity only']),
+    ``,
+    `## Included Free / Built-in Audio Effects (${includedFreeAudioFx.length})`,
+    ``,
+    ...(includedFreeAudioFx.length
+      ? includedFreeAudioFx.map(
+          (afx) =>
+            `- **${afx.name}** → \`${afx.premiereEffectName}\` on Track ${afx.trackId} (Intensity ${afx.intensity}%, Source: ${afx.detectionSource || 'Web Audio DSP'})`
+        )
+      : ['- Standard Audio Levels & Fades only']),
+    ``
+  );
+
+  if (project.audio.spectralProfile) {
+    const sp = project.audio.spectralProfile;
+    lines.push(
+      `## Audio Spectral & Dynamics Telemetry`,
+      ``,
+      `- Sub-Bass: ${sp.subBassEnergy}% | Bass: ${sp.bassEnergy}% | Mid: ${sp.midEnergy}% | High: ${sp.highEnergy}%`,
+      `- Integrated RMS: ${sp.integratedRmsDb} dBFS | Peak: ${sp.peakDb} dBFS | Dynamic Range: ${sp.dynamicRangeDb} dB`,
+      `- Stereo Width: ${sp.stereoWidthPercent}% | Reverb Tail: ${sp.reverbTailEstimate} | Low-Pass Filter: ${sp.lowPassFilterDetected ? 'Detected' : 'None'} | Ducking/Compression: ${sp.sidechainOrDuckingDetected ? 'Detected' : 'None'}`,
+      ``
+    );
+  }
+
+  if (skippedPaidVideoFx.length > 0 || skippedPaidAudioFx.length > 0) {
+    lines.push(
+      `## Skipped Paid / Third-Party Plugins (${skippedPaidVideoFx.length + skippedPaidAudioFx.length})`,
+      ``,
+      `These paid third-party plugins were detected and cleanly bypassed so processing completed with Free / Built-in Premiere Pro effects:`,
+      ...skippedPaidVideoFx.map(
+        (ef) => `- [Video] **${ef.name}** (${ef.pluginVendor || 'Third-Party'}) — ${ef.skippedReason || 'Bypassed'}`
+      ),
+      ...skippedPaidAudioFx.map(
+        (afx) => `- [Audio] **${afx.name}** (${afx.pluginVendor || 'Third-Party'}) — ${afx.skippedReason || 'Bypassed'}`
+      ),
+      ``
+    );
+  }
+
+  if (project.motionGraphics.length > 0) {
+    lines.push(
+      `## Reconstructed Captions & Motion Graphics (${project.motionGraphics.length})`,
+      ``,
+      ...project.motionGraphics.map(
+        (g, i) =>
+          `- **#${i + 1} [${formatTimecodeMs(g.startTimeSec)} – ${formatTimecodeMs(g.endTimeSec)}]** "${g.text}" — Style: \`${g.captionStylePreset || 'Custom'}\` | Animation: \`${g.animationType}\`${g.highlightWord ? ` | Highlight: "${g.highlightWord}" (${g.highlightColorHex})` : ''}${g.spellChecked ? ' | Spellcheck Verified' : ''}`
+      ),
+      ``
+    );
+  }
+
   if (project.skippedStages && project.skippedStages.length > 0) {
     lines.push(
       `## Partial / Skipped Pipeline Stages`,
@@ -617,7 +1204,7 @@ export function generateReconstructionReportMarkdown(project: ReelProject): stri
     `### Approximate Reconstructions`,
     ...project.compatibility.approximate.map((x) => `- ${x}`),
     ``,
-    `### Unsupported / Third-Party Effects`,
+    `### Unsupported / Skipped Paid Effects`,
     ...(project.compatibility.unsupported.length
       ? project.compatibility.unsupported.map((x) => `- ${x}`)
       : ['- None detected']),
@@ -642,11 +1229,12 @@ Sequence: ${project.metadata.width}x${project.metadata.height} @ ${project.metad
 
 1. EXTRACT THIS PACKAGE
    Unzip the entire folder to your local editing drive before opening Adobe Premiere Pro.
-   Keep the relative folder structure intact:
+    Keep the relative folder structure intact:
    - Project/Reel2Premiere_Sequence.xml
    - Media/${sourceFileName}
    - LUTs/Reconstructed_Look.cube
-   - Graphics/Title_*.svg
+   - Graphics/Caption_*.svg & Title_*.svg
+   - Captions/${sanitizeFileName(project.name)}_Captions.srt (if captions were detected)
    - Manifests/
    - Reports/
 
@@ -660,23 +1248,29 @@ Sequence: ${project.metadata.width}x${project.metadata.height} @ ${project.metad
    - If Premiere Pro opens the "Link Media" dialog for ${sourceFileName}:
      Click "Locate...", navigate to the Media/ folder inside this extracted ZIP,
      select ${sourceFileName}, and click OK.
-   - Repeat for any Graphics/Title_*.svg plates if Premiere requests their path.
+   - Repeat for any Graphics/Caption_*.svg or Title_*.svg plates if Premiere requests their path.
 
-4. APPLY THE RECONSTRUCTED COLOR GRADE (.cube LUT)
+4. EDITABLE CAPTIONS (.srt + ANIMATED TRACK V3)
+   - Styled & keyframe-animated caption plates are already placed on Track V3.
+   - For native Premiere Pro Text Panel / Essential Graphics captions, import
+     Captions/${sanitizeFileName(project.name)}_Captions.srt via File > Import... and drag it
+     onto the sequence Captions track.
+
+5. APPLY THE RECONSTRUCTED COLOR GRADE (.cube LUT)
    - Add an Adjustment Layer on Track V2 spanning the sequence (or select clips on V1).
    - Open Window > Lumetri Color > Creative (or Basic Correction > Input LUT).
    - Browse and select: LUTs/Reconstructed_Look.cube
    - Adjust Intensity slider to taste. Note: Estimated color grades are approximations
      derived from rendered pixels; fine-tune skin tones using Lumetri Scopes.
 
-5. AUDIO & BEAT MARKERS
+6. AUDIO & BEAT MARKERS
    - Sequence markers on the timeline ruler mark every detected beat (${project.audio.estimatedBpm || 'N/A'} BPM)
      and transition SFX cue.
-   - Track A1 contains your authorized source audio.
+   - Track A1 contains your authorized source audio with Free / Built-in Premiere audio effects.
    - Track A2 is reserved for a licensed music replacement if redistributing the project.
    - Track A3 is reserved for sound effects (whooshes, impacts, risers).
 
-6. REVIEW COMPATIBILITY REPORT
+7. REVIEW COMPATIBILITY REPORT
    - Open Reports/Reconstruction_Report.md for a full list of native vs. approximate effects.
 `;
 }
@@ -712,9 +1306,10 @@ export async function buildPremiereZipBlob(
     zip.file(`LUTs/Reconstructed_Look.cube`, lutText);
   }
 
-  // Generate transparent SVG graphic plates for every OCR-detected motion graphic
+  // Generate transparent styled SVG graphic plates for every detected caption / motion graphic
   project.motionGraphics.forEach((gfx, idx) => {
-    const gfxName = `Title_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
+    const prefix = gfx.isCaption || gfx.type === 'Caption' || gfx.type === 'Subtitle' ? 'Caption' : 'Title';
+    const gfxName = `${prefix}_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
     const svg = generateGraphicSvgPlate(
       gfx,
       options.widthOverride || project.metadata.width,
@@ -723,14 +1318,33 @@ export async function buildPremiereZipBlob(
     zip.file(`Graphics/${gfxName}`, svg);
   });
 
+  // Bundle Premiere-importable SubRip (.srt) captions whenever captions/text exist
+  const srtText = generateSrtSubtitles(project.motionGraphics);
+  if (srtText.trim().length > 0) {
+    zip.file(`Captions/${safeBase}_Captions.srt`, srtText);
+  }
+
   zip.file(
     `Manifests/Effects_And_Color_Manifest.json`,
     JSON.stringify(
       {
         project: project.name,
         colorGrade: project.colorGrade,
-        effects: project.effects,
-        motionGraphics: project.motionGraphics,
+        includedFreeVideoEffects: project.effects.filter(
+          (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+        ),
+        skippedPaidVideoEffects: project.effects.filter(
+          (e) => e.licenseTier === 'Paid / Third-Party'
+        ),
+        includedFreeAudioEffects: (project.audio.audioEffects ?? []).filter(
+          (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+        ),
+        skippedPaidAudioEffects: (project.audio.audioEffects ?? []).filter(
+          (e) => e.licenseTier === 'Paid / Third-Party'
+        ),
+        audioSpectralProfile: project.audio.spectralProfile ?? null,
+        captionsAndMotionGraphics: project.motionGraphics,
+        srtCaptionsFile: srtText.trim().length > 0 ? `Captions/${safeBase}_Captions.srt` : null,
         sfxEvents: project.audio.sfxEvents,
       },
       null,

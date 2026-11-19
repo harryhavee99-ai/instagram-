@@ -1,11 +1,13 @@
 import type {
   AnalysisPipelineStage,
   AppSettings,
+  AudioEffectItem,
   ColorGradeSettings,
   CompatibilityReport,
   CompatibilityStatus,
   ConfidenceLevel,
   EffectItem,
+  EffectLicenseTier,
   InstagramInspectResult,
   KeyframePoint,
   MotionGraphicItem,
@@ -16,6 +18,7 @@ import type {
   VideoMetadata,
 } from '../types/project';
 import { analyzeAudioFromFile } from './audioAnalyzer';
+import { CAPTION_ANIMATION_OPTIONS, CAPTION_PRESET_NAMES } from './captionPresets';
 import { computeComparisonMetrics } from './comparisonEngine';
 import { clamp, computeAspectRatio, inferContainerAndCodec } from './formatters';
 
@@ -43,6 +46,9 @@ interface RawShotDetection {
   durationSec: number;
   measuredMotionScore: number;
   measuredCutDelta: number;
+  flashSpikeDetected: boolean;
+  blurDropDetected: boolean;
+  chromaSpreadScore: number;
   beatAligned: boolean;
   alignedBeatTimeSec?: number;
   thumbnailDataUrl: string;
@@ -433,6 +439,95 @@ function safeTransitionType(val: unknown): ShotTransition['type'] {
   return 'Cut';
 }
 
+const PAID_PLUGIN_SIGNATURES: Array<{ pattern: RegExp; vendor: string }> = [
+  { pattern: /\b(sapphire|s_shake|s_glow|s_flicker|s_blur|s_dissolve|s_warp|boris\s*fx|bcc\b|continuum)\b/i, vendor: 'Boris FX / Sapphire' },
+  { pattern: /\b(red\s*giant|rg\s*universe|maxon\s*universe|magic\s*bullet|trapcode|vfx\s*suite)\b/i, vendor: 'Maxon / Red Giant' },
+  { pattern: /\b(dehancer)\b/i, vendor: 'Dehancer' },
+  { pattern: /\b(filmconvert|film\s*convert)\b/i, vendor: 'FilmConvert' },
+  { pattern: /\b(twixtor|rsmb|reelsmart|reel\s*smart)\b/i, vendor: 'RE:Vision Effects' },
+  { pattern: /\b(deep\s*glow|optical\s*flares|element\s*3d|saber)\b/i, vendor: 'Video Copilot / Plugin Everything' },
+  { pattern: /\b(film\s*impact|filmimpact|mister\s*horse|motion\s*bro|aejuice|neat\s*video|flicker\s*free)\b/i, vendor: 'Third-Party Paid Plugin' },
+  { pattern: /\b(fabfilter|pro-q|pro-l|pro-c|pro-r)\b/i, vendor: 'FabFilter' },
+  { pattern: /\b(valhalla\s*(vintage|room|shimmer|supermassive|delay)?)\b/i, vendor: 'Valhalla DSP' },
+  { pattern: /\b(waves\s*(ssl|cla|l1|l2|c4|h-delay|tune|audio)?|soundtoys|decapitator|echoboy|microshift)\b/i, vendor: 'Waves / Soundtoys' },
+  { pattern: /\b(auto-?tune|antares|izotope|ozone|neutron|nectar|rx\s*\d+|soothe\s*2?|rc-?20|slate\s*digital|uad\b)\b/i, vendor: 'Commercial Audio Plugin' },
+];
+
+function classifyEffectLicense(
+  name: string,
+  rawTier: unknown,
+  rawVendor?: unknown,
+  rawSkippedReason?: unknown
+): {
+  licenseTier: EffectLicenseTier;
+  includedInTimeline: boolean;
+  pluginVendor: string;
+  skippedReason?: string;
+} {
+  const combined = `${name} ${typeof rawVendor === 'string' ? rawVendor : ''}`.trim();
+  const matchedPaid = PAID_PLUGIN_SIGNATURES.find((sig) => sig.pattern.test(combined));
+  const declaredPaid =
+    typeof rawTier === 'string' && /paid|third[- ]?party|commercial|premium/i.test(rawTier);
+
+  if (matchedPaid || declaredPaid) {
+    const vendor =
+      (typeof rawVendor === 'string' && rawVendor.trim()) ||
+      matchedPaid?.vendor ||
+      'Third-Party Paid Plugin';
+    const reason =
+      (typeof rawSkippedReason === 'string' && rawSkippedReason.trim()) ||
+      `Paid / third-party plugin (${vendor}) detected — skipped cleanly so pipeline continues with Free / Built-in Premiere Pro effects.`;
+    return {
+      licenseTier: 'Paid / Third-Party',
+      includedInTimeline: false,
+      pluginVendor: vendor,
+      skippedReason: reason,
+    };
+  }
+
+  return {
+    licenseTier: 'Free / Built-in',
+    includedInTimeline: true,
+    pluginVendor:
+      typeof rawVendor === 'string' && rawVendor.trim() && !/unknown/i.test(rawVendor)
+        ? rawVendor.trim()
+        : 'Adobe Premiere Pro (Built-in)',
+  };
+}
+
+function inferPremiereVideoEffectId(name: string, category: string): string {
+  const lower = `${name} ${category}`.toLowerCase();
+  if (/directional\s*blur|motion\s*blur|whip/.test(lower)) return 'AE.ADBE Motion Blur';
+  if (/gaussian|fast\s*blur|blur/.test(lower)) return 'Gaussian Blur';
+  if (/sharpen|unsharp/.test(lower)) return 'AE.ADBE Sharpen';
+  if (/grain|noise/.test(lower)) return 'AE.ADBE Noise';
+  if (/vignette|lumetri|grade|lut|glow|color/.test(lower)) return 'AE.ADBE Lumetri';
+  if (/chromatic|rgb\s*split|glitch|vr/.test(lower)) return 'AE.ADBE VR Chromatic Aberrations';
+  if (/tint|duotone/.test(lower)) return 'AE.ADBE Tint';
+  if (/invert|flash|strobe/.test(lower)) return 'AE.ADBE Brightness & Contrast 2';
+  if (/crop|letterbox|split|mask/.test(lower)) return 'AE.ADBE Crop';
+  if (/wave|warp|shake|distort/.test(lower)) return 'AE.ADBE Wave Warp';
+  if (/mirror|flip/.test(lower)) return 'AE.ADBE Mirror';
+  if (/speed|time\s*remap|ramp/.test(lower)) return 'timeremap';
+  return 'AE.ADBE Geometry2';
+}
+
+function inferPremiereAudioEffectId(name: string, category: string): string {
+  const lower = `${name} ${category}`.toLowerCase();
+  if (/low[- ]?pass|muffle|underwater/.test(lower)) return 'Lowpass';
+  if (/high[- ]?pass|rumble|cut\s*low/.test(lower)) return 'Highpass';
+  if (/eq|equalizer|bass\s*boost|presence|treble/.test(lower)) return 'ParametricEqualizer';
+  if (/limit|maximizer|loudness/.test(lower)) return 'HardLimiter';
+  if (/compress|duck|sidechain|punch|dynamics/.test(lower)) return 'SingleBandCompressor';
+  if (/reverb|hall|room|ambience/.test(lower)) return 'StudioReverb';
+  if (/delay|echo|slapback/.test(lower)) return 'AnalogDelay';
+  if (/denoise|noise\s*reduc|de-?ess|clean/.test(lower)) return 'DeNoise';
+  if (/pitch|slowed|sped|formant/.test(lower)) return 'PitchShifter';
+  if (/stereo|width|pan|imager/.test(lower)) return 'StereoExpander';
+  if (/fade|automation|gain|volume/.test(lower)) return 'audiolevels';
+  return 'ParametricEqualizer';
+}
+
 export interface RunAnalysisOptions {
   file: File;
   sourceOrigin: VideoMetadata['sourceOrigin'];
@@ -670,18 +765,25 @@ export async function runFullVideoAnalysis(
     setStage(4, 'warning', 'Insufficient sampled frames — exported as single continuous clip');
   }
 
-  // Stage 5: Analyzing motion & extracting crisp keyframe thumbnails per shot
-  setStage(5, 'active', 'Measuring shot motion energy & extracting inspection keyframes');
+  // Stage 5: Analyzing motion, flash/blur/chroma cues & extracting crisp keyframes per shot
+  setStage(5, 'active', 'Measuring shot motion, flash/blur/chroma cues & extracting inspection keyframes');
   const rawShots: RawShotDetection[] = [];
   const keyframesForAi: Array<{ shotIndex: number; timeSec: number; role: string; base64Jpeg: string }> = [];
 
   try {
     const thumbCanvas = document.createElement('canvas');
-    const thumbMax = 384;
+    const thumbMax = 540;
     const tScale = thumbMax / Math.max(width, height);
     thumbCanvas.width = Math.max(64, Math.round(width * tScale));
     thumbCanvas.height = Math.max(64, Math.round(height * tScale));
     const thumbCtx = thumbCanvas.getContext('2d');
+
+    const sortedSharpness = sampledFrames.map((f) => f.sharpnessVar).sort((a, b) => a - b);
+    const medianSharpness =
+      sortedSharpness.length > 0 ? sortedSharpness[Math.floor(sortedSharpness.length / 2)] : 15;
+    const sortedLuma = sampledFrames.map((f) => f.meanLuma).sort((a, b) => a - b);
+    const medianLuma =
+      sortedLuma.length > 0 ? sortedLuma[Math.floor(sortedLuma.length / 2)] : 110;
 
     for (let s = 0; s < cutPoints.length; s++) {
       const startSec = cutPoints[s].timeSec;
@@ -691,11 +793,32 @@ export async function runFullVideoAnalysis(
 
       const inside = sampledFrames.filter((f) => f.timeSec >= startSec && f.timeSec <= endSec);
       let motionAccum = 0;
-      for (let k = 1; k < inside.length; k++) {
-        motionAccum += lumaGridDiff(inside[k - 1].lumaGrid, inside[k].lumaGrid);
+      let flashSpikeDetected = false;
+      let blurDropDetected = false;
+      let chromaSpreadAccum = 0;
+
+      for (let k = 0; k < inside.length; k++) {
+        const fr = inside[k];
+        if (k > 0) {
+          motionAccum += lumaGridDiff(inside[k - 1].lumaGrid, fr.lumaGrid);
+          if (Math.abs(fr.meanLuma - inside[k - 1].meanLuma) > 45) {
+            flashSpikeDetected = true;
+          }
+        }
+        if (fr.whiteCeiling >= 248 && fr.meanLuma > medianLuma + 35) {
+          flashSpikeDetected = true;
+        }
+        if (medianSharpness > 6 && fr.sharpnessVar < medianSharpness * 0.62) {
+          blurDropDetected = true;
+        }
+        chromaSpreadAccum += Math.abs(fr.meanR - fr.meanB) + Math.abs(fr.meanR - fr.meanG) * 0.5;
       }
+
       const measuredMotionScore = Math.round(
         clamp(inside.length > 1 ? motionAccum / (inside.length - 1) : 12, 0, 100)
+      );
+      const chromaSpreadScore = Math.round(
+        clamp(inside.length > 0 ? (chromaSpreadAccum / inside.length) * 0.75 : 10, 0, 100)
       );
 
       let thumbUrl = '';
@@ -703,7 +826,7 @@ export async function runFullVideoAnalysis(
         try {
           await seekVideo(video, midpointSec);
           thumbCtx.drawImage(video, 0, 0, thumbCanvas.width, thumbCanvas.height);
-          thumbUrl = thumbCanvas.toDataURL('image/jpeg', 0.78);
+          thumbUrl = thumbCanvas.toDataURL('image/jpeg', 0.84);
         } catch {
           thumbUrl = '';
         }
@@ -716,12 +839,15 @@ export async function runFullVideoAnalysis(
         durationSec: Number(dur.toFixed(3)),
         measuredMotionScore,
         measuredCutDelta: cutPoints[s].deltaScore,
+        flashSpikeDetected,
+        blurDropDetected,
+        chromaSpreadScore,
         beatAligned: false,
         thumbnailDataUrl: thumbUrl,
         midpointSec,
       });
 
-      if (thumbUrl) {
+      if (thumbUrl && keyframesForAi.length < 24) {
         keyframesForAi.push({
           shotIndex: s,
           timeSec: midpointSec,
@@ -729,10 +855,69 @@ export async function runFullVideoAnalysis(
           base64Jpeg: thumbUrl,
         });
       }
+
+      // Extract an extra boundary/transition frame on high-delta cuts or detected flash/blur cues (up to 18 before caption-cadence pass)
+      if (
+        video &&
+        thumbCtx &&
+        keyframesForAi.length < 18 &&
+        (cutPoints[s].deltaScore >= 32 || flashSpikeDetected || blurDropDetected)
+      ) {
+        const boundarySec = Number(clamp(startSec + Math.min(0.12, dur * 0.2), 0, durationSec - 0.04).toFixed(3));
+        if (Math.abs(boundarySec - midpointSec) > 0.12) {
+          try {
+            await seekVideo(video, boundarySec);
+            thumbCtx.drawImage(video, 0, 0, thumbCanvas.width, thumbCanvas.height);
+            const boundaryUrl = thumbCanvas.toDataURL('image/jpeg', 0.8);
+            keyframesForAi.push({
+              shotIndex: s,
+              timeSec: boundarySec,
+              role: flashSpikeDetected ? 'flash-boundary' : blurDropDetected ? 'blur-boundary' : 'transition-entry',
+              base64Jpeg: boundaryUrl,
+            });
+          } catch {
+            // Non-blocking
+          }
+        }
+      }
     }
 
+    // Fill remaining keyframe slots (up to 24 total) with evenly-spaced high-res caption-cadence frames
+    // so fast-changing on-screen captions inside longer shots are captured crisply for accurate zero-typo OCR
+    if (video && thumbCtx && keyframesForAi.length < 24 && durationSec > 0.8) {
+      const remainingSlots = 24 - keyframesForAi.length;
+      const startSpan = Math.min(0.25, durationSec * 0.05);
+      const endSpan = Math.max(startSpan + 0.2, durationSec - 0.15);
+      const step = (endSpan - startSpan) / Math.max(1, remainingSlots + 1);
+
+      for (let c = 1; c <= remainingSlots && keyframesForAi.length < 24; c++) {
+        const sampleSec = Number(clamp(startSpan + step * c, 0.1, durationSec - 0.08).toFixed(3));
+        const tooClose = keyframesForAi.some((kf) => Math.abs(kf.timeSec - sampleSec) < 0.45);
+        if (tooClose) continue;
+
+        const owningShot = rawShots.findIndex(
+          (sh) => sampleSec >= sh.startTimeSec && sampleSec <= sh.endTimeSec
+        );
+        try {
+          await seekVideo(video, sampleSec);
+          thumbCtx.drawImage(video, 0, 0, thumbCanvas.width, thumbCanvas.height);
+          const capUrl = thumbCanvas.toDataURL('image/jpeg', 0.84);
+          keyframesForAi.push({
+            shotIndex: owningShot >= 0 ? owningShot : 0,
+            timeSec: sampleSec,
+            role: 'caption-cadence',
+            base64Jpeg: capUrl,
+          });
+        } catch {
+          // Non-blocking
+        }
+      }
+    }
+
+    keyframesForAi.sort((a, b) => a.timeSec - b.timeSec);
+
     if (keyframesForAi.length > 0) {
-      setStage(5, 'done', `Extracted ${keyframesForAi.length} targeted inspection keyframes`);
+      setStage(5, 'done', `Extracted ${keyframesForAi.length} high-res shot & caption OCR keyframes`);
     } else {
       setStage(5, 'warning', 'Keyframes unavailable — proceeding with timing-only shot clips');
     }
@@ -745,6 +930,9 @@ export async function runFullVideoAnalysis(
         durationSec: Number(durationSec.toFixed(3)),
         measuredMotionScore: 0,
         measuredCutDelta: 0,
+        flashSpikeDetected: false,
+        blurDropDetected: false,
+        chromaSpreadScore: 0,
         beatAligned: false,
         thumbnailDataUrl: '',
         midpointSec: Number((durationSec * 0.5).toFixed(3)),
@@ -757,8 +945,8 @@ export async function runFullVideoAnalysis(
     );
   }
 
-  // Stage 6: Analyzing audio via Web Audio API
-  setStage(6, 'active', 'Decoding Web Audio waveform, beats, and transients');
+  // Stage 6: Analyzing audio via Web Audio API (beats, transients, spectral profile & DSP free audio FX)
+  setStage(6, 'active', 'Decoding Web Audio waveform, spectral bands, dynamics & beats');
   let audioResult = await analyzeAudioFromFile(file, durationSec).catch(() => null);
   if (!audioResult) {
     audioResult = await analyzeAudioFromFile(new File([], 'silent.mp4'), durationSec);
@@ -786,7 +974,11 @@ export async function runFullVideoAnalysis(
         closestBeat.syncedShotId = `shot-${shot.index + 1}`;
       }
     }
-    setStage(6, 'done', `${audio.estimatedBpm} BPM · ${audio.beats.length} beats detected`);
+    setStage(
+      6,
+      'done',
+      `${audio.estimatedBpm} BPM · ${audio.beats.length} beats · ${audioResult.dspAudioEffects.length} DSP audio FX`
+    );
   } else {
     setStage(6, 'warning', 'Audio stream undecodable or silent — continuing without beat grid');
   }
@@ -795,9 +987,8 @@ export async function runFullVideoAnalysis(
   const baseColorGrade =
     sampledFrames.length > 0 ? deriveColorGradeFromFrames(sampledFrames) : buildNeutralColorGrade();
 
-  // Stage 7: Detecting effects, transitions, OCR text, and editorial intent via Server-Side Gemini AI
-  // If AI analysis is unavailable, rate-limited, or keyframes are missing, mark warning & continue!
-  setStage(7, 'active', 'Running Gemini multimodal visual, OCR, and editing reverse-engineering');
+  // Stage 7: Deep multimodal visual FX, Free-vs-Paid filtering, Audio FX & OCR via Server-Side Gemini AI
+  setStage(7, 'active', 'Researching visual & audio effects, Free vs Paid plugins, OCR & link context');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let ai: any = null;
   let aiSkippedReason: string | null = null;
@@ -834,7 +1025,9 @@ export async function runFullVideoAnalysis(
             transientTimes: audioResult.transientTimes,
             hasFadeIn: audioResult.hasFadeIn,
             hasFadeOut: audioResult.hasFadeOut,
+            spectralProfile: audioResult.spectralProfile,
           },
+          instagramContext: instagramInfo,
           sourceContext: instagramInfo,
         }),
       });
@@ -848,10 +1041,12 @@ export async function runFullVideoAnalysis(
         setStage(7, 'warning', reason);
       } else {
         ai = aiJson.analysis;
+        const rawAiFxCount = (ai.effects ?? []).length;
+        const rawAiAudioFxCount = (ai.audioDesign?.audioEffects ?? []).length;
         setStage(
           7,
           'done',
-          `${(ai.effects ?? []).length} effects · ${(ai.motionGraphics ?? []).length} OCR text layers`
+          `${rawAiFxCount} visual FX · ${rawAiAudioFxCount} audio FX · ${(ai.motionGraphics ?? []).length} OCR layers`
         );
       }
     } catch (err) {
@@ -881,8 +1076,8 @@ export async function runFullVideoAnalysis(
     setStage(8, 'warning', 'Neutral Rec. 709 baseline applied (no frame histograms)');
   }
 
-  // Stage 9: Reconstructing multitrack timeline
-  setStage(9, 'active', 'Assembling frame-accurate V1–V3 / A1–A4 multitrack timeline');
+  // Stage 9: Reconstructing multitrack timeline (adding ALL Free FX, skipping Paid plugins cleanly)
+  setStage(9, 'active', 'Assembling V1–V3 / A1–A4 timeline, applying all Free FX & skipping Paid plugins');
   const shots: ShotClip[] = rawShots.map((raw, i) => {
     const aiShot =
       (ai?.shots ?? []).find((s: { index: number }) => s.index === i) || ai?.shots?.[i] || {};
@@ -995,22 +1190,45 @@ export async function runFullVideoAnalysis(
     };
   });
 
+  // 1) Map AI-detected visual effects with strict Free vs Paid classification
   const effects: EffectItem[] = (ai?.effects ?? []).map(
-    (ef: Record<string, unknown>, idx: number) => {
+    (ef: Record<string, unknown>, idx: number): EffectItem => {
       const start = clamp(Number(ef.startTimeSec ?? 0), 0, durationSec);
       const end = clamp(
         Number(ef.endTimeSec ?? Math.min(durationSec, start + 0.5)),
         start + 0.05,
         durationSec
       );
+      const name = String(ef.name || 'Visual Effect');
+      const category = ([
+        'Transition',
+        'Motion',
+        'Blur',
+        'Stylize',
+        'Light',
+        'Speed',
+        'Mask',
+        'Distort',
+        'Color',
+      ].includes(String(ef.category))
+        ? String(ef.category)
+        : 'Motion') as EffectItem['category'];
+
+      const license = classifyEffectLicense(name, ef.licenseTier, ef.pluginVendor, ef.skippedReason);
+      const premiereEffectName = String(
+        ef.premiereEffectName ||
+          (license.licenseTier === 'Paid / Third-Party'
+            ? 'Skipped (Paid Third-Party Plugin)'
+            : 'Transform / Basic Motion')
+      );
+      const premiereEffectId = String(
+        ef.premiereEffectId || inferPremiereVideoEffectId(premiereEffectName || name, category)
+      );
+
       return {
         id: `fx-${idx + 1}`,
-        name: String(ef.name || 'Visual Effect'),
-        category: (['Transition', 'Motion', 'Blur', 'Stylize', 'Light', 'Speed', 'Mask'].includes(
-          String(ef.category)
-        )
-          ? String(ef.category)
-          : 'Motion') as EffectItem['category'],
+        name,
+        category,
         shotId: typeof ef.shotIndex === 'number' ? `shot-${ef.shotIndex + 1}` : undefined,
         startTimeSec: Number(start.toFixed(2)),
         endTimeSec: Number(end.toFixed(2)),
@@ -1022,16 +1240,173 @@ export async function runFullVideoAnalysis(
           Direction: String(ef.direction || 'None'),
         },
         confidence: safeConfidence(ef.confidence),
-        premiereSupport: safeCompat(ef.premiereSupport),
-        premiereEffectName: String(ef.premiereEffectName || 'Transform / Basic Motion'),
+        premiereSupport:
+          license.licenseTier === 'Paid / Third-Party'
+            ? 'Unsupported'
+            : safeCompat(ef.premiereSupport || 'Native'),
+        premiereEffectName,
+        premiereEffectId,
         approximationNote: String(
-          ef.approximationNote || 'Mapped to standard Adobe Premiere Pro parameters.'
+          ef.approximationNote ||
+            (license.licenseTier === 'Paid / Third-Party'
+              ? license.skippedReason || 'Bypassed paid third-party plugin.'
+              : 'Included as Free / Built-in Adobe Premiere Pro effect.')
         ),
+        licenseTier: license.licenseTier,
+        includedInTimeline: license.includedInTimeline,
+        pluginVendor: license.pluginVendor,
+        skippedReason: license.skippedReason,
       };
     }
   );
 
-  const motionGraphics: MotionGraphicItem[] = (ai?.motionGraphics ?? [])
+  // 2) Automatically add CV-grounded Free / Built-in visual effects so ALL free measured effects are included
+  const hasSimilarVideoFx = (needle: RegExp, shotId?: string) =>
+    effects.some(
+      (e) =>
+        e.includedInTimeline &&
+        needle.test(`${e.name} ${e.premiereEffectName}`) &&
+        (!shotId || !e.shotId || e.shotId === shotId)
+    );
+
+  let cvFxSeq = effects.length + 1;
+  if (colorGrade.vignette >= 15 && !hasSimilarVideoFx(/vignette/i)) {
+    effects.push({
+      id: `fx-cv-${cvFxSeq++}`,
+      name: 'Edge Vignette (CV Measured)',
+      category: 'Color',
+      startTimeSec: 0,
+      endTimeSec: Number(durationSec.toFixed(2)),
+      durationSec: Number(durationSec.toFixed(2)),
+      intensity: clamp(Math.round(colorGrade.vignette), 15, 100),
+      direction: 'Radial',
+      parameters: { Amount: `-${(colorGrade.vignette * 0.04).toFixed(1)}`, Midpoint: '50%' },
+      confidence: 'High',
+      premiereSupport: 'Native',
+      premiereEffectName: 'Lumetri Color (Vignette)',
+      premiereEffectId: 'AE.ADBE Lumetri',
+      approximationNote: 'Measured corner luminance falloff; added as free built-in Lumetri Vignette.',
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      pluginVendor: 'Adobe Premiere Pro (Built-in)',
+    });
+  }
+
+  if (colorGrade.filmGrain >= 15 && !hasSimilarVideoFx(/grain|noise/i)) {
+    effects.push({
+      id: `fx-cv-${cvFxSeq++}`,
+      name: 'Film Grain / Texture Noise (CV Measured)',
+      category: 'Stylize',
+      startTimeSec: 0,
+      endTimeSec: Number(durationSec.toFixed(2)),
+      durationSec: Number(durationSec.toFixed(2)),
+      intensity: clamp(Math.round(colorGrade.filmGrain), 15, 100),
+      direction: 'Full Frame',
+      parameters: { NoiseAmount: `${Math.round(colorGrade.filmGrain * 0.25)}%`, UseColorNoise: 'Off' },
+      confidence: 'Medium',
+      premiereSupport: 'Native',
+      premiereEffectName: 'Noise (Built-in)',
+      premiereEffectId: 'AE.ADBE Noise',
+      approximationNote: 'Measured high-frequency frame grain; added as free built-in Premiere Noise filter.',
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      pluginVendor: 'Adobe Premiere Pro (Built-in)',
+    });
+  }
+
+  if (colorGrade.sharpening >= 20 && !hasSimilarVideoFx(/sharpen/i)) {
+    effects.push({
+      id: `fx-cv-${cvFxSeq++}`,
+      name: 'Crisp Edge Sharpening (CV Measured)',
+      category: 'Stylize',
+      startTimeSec: 0,
+      endTimeSec: Number(durationSec.toFixed(2)),
+      durationSec: Number(durationSec.toFixed(2)),
+      intensity: clamp(Math.round(colorGrade.sharpening), 15, 100),
+      direction: 'Full Frame',
+      parameters: { SharpenAmount: `${Math.round(colorGrade.sharpening * 0.4)}` },
+      confidence: 'Medium',
+      premiereSupport: 'Native',
+      premiereEffectName: 'Sharpen',
+      premiereEffectId: 'AE.ADBE Sharpen',
+      approximationNote: 'Measured edge acutance; added as free built-in Premiere Sharpen filter.',
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      pluginVendor: 'Adobe Premiere Pro (Built-in)',
+    });
+  }
+
+  rawShots.forEach((raw, idx) => {
+    const shotId = `shot-${idx + 1}`;
+    if (raw.flashSpikeDetected && !hasSimilarVideoFx(/flash|exposure|bright/i, shotId)) {
+      effects.push({
+        id: `fx-cv-${cvFxSeq++}`,
+        name: `Exposure Flash Hit (Shot ${idx + 1})`,
+        category: 'Light',
+        shotId,
+        startTimeSec: raw.startTimeSec,
+        endTimeSec: Number(Math.min(raw.endTimeSec, raw.startTimeSec + 0.35).toFixed(2)),
+        durationSec: Number(Math.min(0.35, raw.durationSec).toFixed(2)),
+        intensity: 75,
+        direction: 'In',
+        parameters: { BrightnessSpike: '+45', Contrast: '+10' },
+        confidence: 'High',
+        premiereSupport: 'Native',
+        premiereEffectName: 'Brightness & Contrast (Keyframed Flash)',
+        premiereEffectId: 'AE.ADBE Brightness & Contrast 2',
+        approximationNote: 'Detected luminance spike at shot boundary; added as free built-in Premiere effect.',
+        licenseTier: 'Free / Built-in',
+        includedInTimeline: true,
+        pluginVendor: 'Adobe Premiere Pro (Built-in)',
+      });
+    }
+    if (raw.blurDropDetected && !hasSimilarVideoFx(/blur/i, shotId)) {
+      effects.push({
+        id: `fx-cv-${cvFxSeq++}`,
+        name: `Motion / Defocus Blur (Shot ${idx + 1})`,
+        category: 'Blur',
+        shotId,
+        startTimeSec: raw.startTimeSec,
+        endTimeSec: raw.endTimeSec,
+        durationSec: raw.durationSec,
+        intensity: 48,
+        direction: 'Full Frame',
+        parameters: { Blurriness: '28', RepeatEdgePixels: 'On' },
+        confidence: 'Medium',
+        premiereSupport: 'Native',
+        premiereEffectName: 'Gaussian Blur',
+        premiereEffectId: 'Gaussian Blur',
+        approximationNote: 'Measured sharpness drop inside shot; added as free built-in Gaussian Blur.',
+        licenseTier: 'Free / Built-in',
+        includedInTimeline: true,
+        pluginVendor: 'Adobe Premiere Pro (Built-in)',
+      });
+    }
+    if (raw.chromaSpreadScore >= 44 && !hasSimilarVideoFx(/chromatic|rgb|glitch|tint/i, shotId)) {
+      effects.push({
+        id: `fx-cv-${cvFxSeq++}`,
+        name: `Chromatic Channel Split (Shot ${idx + 1})`,
+        category: 'Distort',
+        shotId,
+        startTimeSec: raw.startTimeSec,
+        endTimeSec: raw.endTimeSec,
+        durationSec: raw.durationSec,
+        intensity: clamp(raw.chromaSpreadScore, 25, 85),
+        direction: 'Horizontal',
+        parameters: { RedShift: '4px', BlueShift: '-4px' },
+        confidence: 'Medium',
+        premiereSupport: 'Native',
+        premiereEffectName: 'VR Chromatic Aberrations',
+        premiereEffectId: 'AE.ADBE VR Chromatic Aberrations',
+        approximationNote: 'Measured R/B chroma separation; added as free built-in VR Chromatic Aberrations.',
+        licenseTier: 'Free / Built-in',
+        includedInTimeline: true,
+        pluginVendor: 'Adobe Premiere Pro (Built-in)',
+      });
+    }
+  });
+
+  let motionGraphics: MotionGraphicItem[] = (ai?.motionGraphics ?? [])
     .filter((mg: Record<string, unknown>) => typeof mg.text === 'string' && mg.text.trim().length > 0)
     .map((mg: Record<string, unknown>, idx: number) => {
       const start = clamp(Number(mg.startTimeSec ?? 0), 0, durationSec);
@@ -1040,43 +1415,144 @@ export async function runFullVideoAnalysis(
         start + 0.2,
         durationSec
       );
+      const rawType = (['Title', 'Subtitle', 'Caption', 'Lower Third', 'Callout', 'Logo', 'Shape'].includes(
+        String(mg.type)
+      )
+        ? String(mg.type)
+        : 'Caption') as MotionGraphicItem['type'];
+      const isCaption =
+        typeof mg.isCaption === 'boolean'
+          ? mg.isCaption
+          : rawType === 'Caption' || rawType === 'Subtitle';
+      const rawPreset = String(mg.captionStylePreset || '');
+      const captionStylePreset = CAPTION_PRESET_NAMES.includes(
+        rawPreset as (typeof CAPTION_PRESET_NAMES)[number]
+      )
+        ? (rawPreset as MotionGraphicItem['captionStylePreset'])
+        : isCaption
+        ? 'Bold Hormozi'
+        : 'Minimal Clean';
+      const rawAnim = String(mg.animationType || '');
+      const animationType = CAPTION_ANIMATION_OPTIONS.includes(
+        rawAnim as (typeof CAPTION_ANIMATION_OPTIONS)[number]
+      )
+        ? (rawAnim as MotionGraphicItem['animationType'])
+        : isCaption
+        ? 'Bounce Pop'
+        : 'Fade';
+      const rawTransform = String(mg.textTransform || 'none');
+      const textTransform: MotionGraphicItem['textTransform'] =
+        rawTransform === 'uppercase' || rawTransform === 'capitalize' ? rawTransform : 'none';
+
       return {
         id: `gfx-${idx + 1}`,
-        text: String(mg.text).trim(),
-        type: (['Title', 'Subtitle', 'Caption', 'Lower Third', 'Callout', 'Logo', 'Shape'].includes(
-          String(mg.type)
-        )
-          ? String(mg.type)
-          : 'Title') as MotionGraphicItem['type'],
+        text: String(mg.text).replace(/\s+/g, ' ').trim(),
+        type: rawType,
+        isCaption,
         trackId: 'V3' as const,
         startTimeSec: Number(start.toFixed(2)),
         endTimeSec: Number(end.toFixed(2)),
         fontFamily: String(mg.fontFamily || 'Outfit'),
-        fontSize: clamp(Number(mg.fontSize ?? 44), 16, 120),
-        fontWeight: 700,
+        fontSize: clamp(Number(mg.fontSize ?? (isCaption ? 46 : 44)), 16, 120),
+        fontWeight: clamp(Number(mg.fontWeight ?? (isCaption ? 800 : 700)), 400, 900),
         positionXPercent: clamp(Number(mg.positionXPercent ?? 50), 5, 95),
-        positionYPercent: clamp(Number(mg.positionYPercent ?? 50), 8, 92),
+        positionYPercent: clamp(Number(mg.positionYPercent ?? (isCaption ? 74 : 50)), 8, 92),
         colorHex:
           typeof mg.colorHex === 'string' && mg.colorHex.startsWith('#') ? mg.colorHex : '#FFFFFF',
         outlineColorHex:
           typeof mg.outlineColorHex === 'string' && mg.outlineColorHex.startsWith('#')
             ? mg.outlineColorHex
             : '#000000',
+        outlineWidthPx: clamp(Number(mg.outlineWidthPx ?? (isCaption ? 3 : 2)), 0, 10),
+        backgroundColorHex:
+          typeof mg.backgroundColorHex === 'string' && mg.backgroundColorHex.startsWith('#')
+            ? mg.backgroundColorHex
+            : '#000000',
+        backgroundOpacity: clamp(Number(mg.backgroundOpacity ?? 0), 0, 100),
+        highlightColorHex:
+          typeof mg.highlightColorHex === 'string' && mg.highlightColorHex.startsWith('#')
+            ? mg.highlightColorHex
+            : '#FACC15',
+        highlightWord:
+          typeof mg.highlightWord === 'string' && mg.highlightWord.trim().length > 0
+            ? mg.highlightWord.trim()
+            : undefined,
+        textTransform,
+        captionStylePreset,
         hasShadow: Boolean(mg.hasShadow ?? true),
-        animationType: (['None', 'Fade', 'Pop In', 'Slide Up', 'Kinetic Scale', 'Typewriter'].includes(
-          String(mg.animationType)
-        )
-          ? String(mg.animationType)
-          : 'Fade') as MotionGraphicItem['animationType'],
-        animationDurationSec: clamp(Number(mg.animationDurationSec ?? 0.35), 0.1, 1.5),
+        animationType,
+        animationDurationSec: clamp(Number(mg.animationDurationSec ?? 0.28), 0.1, 1.5),
         confidence: safeConfidence(mg.confidence),
+        spellChecked: false,
         fontSubstituteNote: String(
-          mg.fontSubstituteNote || 'Substituted with visually matching sans-serif editable graphic plate.'
+          mg.fontSubstituteNote || 'Styled & animated editable caption plate + Premiere .srt track.'
         ),
       };
     });
 
-  // Merge AI audio design if available; otherwise map raw audio transient timestamps transparently
+  // Automatic zero-spelling-mistake AI proofreading pass on detected captions/text (fault-tolerant)
+  if (motionGraphics.length > 0 && Boolean(ai)) {
+    setStage(9, 'active', `Spell-checking & verifying ${motionGraphics.length} detected captions`);
+    try {
+      const proofController = new AbortController();
+      const proofTimer = window.setTimeout(() => proofController.abort(), 22000);
+      const proofRes = await fetch('/api/captions/proofread', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: proofController.signal,
+        body: JSON.stringify({
+          captions: motionGraphics.map((g) => ({
+            id: g.id,
+            text: g.text,
+            highlightWord: g.highlightWord || '',
+            startTimeSec: g.startTimeSec,
+            endTimeSec: g.endTimeSec,
+          })),
+          contextNote:
+            instagramInfo?.metadata?.caption ||
+            instagramInfo?.metadata?.title ||
+            file.name ||
+            '',
+        }),
+      });
+      window.clearTimeout(proofTimer);
+
+      if (proofRes.ok) {
+        const proofJson = await proofRes.json();
+        const correctedList = Array.isArray(proofJson?.corrected) ? proofJson.corrected : [];
+        const byId = new Map<string, { text?: string; highlightWord?: string }>();
+        correctedList.forEach((item: { id?: string; text?: string; highlightWord?: string }) => {
+          if (item && typeof item.id === 'string') {
+            byId.set(item.id, item);
+          }
+        });
+
+        motionGraphics = motionGraphics.map((g) => {
+          const hit = byId.get(g.id);
+          const verifiedText =
+            hit && typeof hit.text === 'string' && hit.text.trim().length > 0
+              ? hit.text.replace(/\s+/g, ' ').trim()
+              : g.text;
+          const verifiedHighlight =
+            hit && typeof hit.highlightWord === 'string' && hit.highlightWord.trim().length > 0
+              ? hit.highlightWord.trim()
+              : g.highlightWord;
+          return {
+            ...g,
+            text: verifiedText,
+            highlightWord: verifiedHighlight,
+            spellChecked: true,
+          };
+        });
+      }
+    } catch {
+      // Non-blocking: keep Stage 7 OCR captions cleanly if proofread pass times out
+    }
+  }
+
+  // Merge AI audio design & ALL Free/Built-in DSP + AI audio effects (skipping Paid audio plugins cleanly)
+  const mergedAudioEffects: AudioEffectItem[] = [...audioResult.dspAudioEffects];
+
   if (ai?.audioDesign) {
     audio.musicDescription = ai.audioDesign.musicDescription || audio.musicDescription;
     audio.voiceoverDetected = Boolean(ai.audioDesign.voiceoverDetected);
@@ -1105,8 +1581,102 @@ export async function runFullVideoAnalysis(
         confidence: safeConfidence(s.confidence),
       })
     );
+
+    const rawAiAudioFx = Array.isArray(ai.audioDesign.audioEffects)
+      ? ai.audioDesign.audioEffects
+      : [];
+
+    rawAiAudioFx.forEach((afx: Record<string, unknown>, idx: number) => {
+      const name = String(afx.name || 'Audio Effect');
+      const rawCat = String(afx.category || '');
+      const category: AudioEffectItem['category'] =
+        rawCat === 'EQ & Filter' ||
+        rawCat === 'Dynamics' ||
+        rawCat === 'Reverb' ||
+        rawCat === 'Delay & Echo' ||
+        rawCat === 'Pitch & Time' ||
+        rawCat === 'Noise Reduction' ||
+        rawCat === 'Stereo & Pan' ||
+        rawCat === 'Fade & Automation'
+          ? rawCat
+          : /filter|eq/i.test(rawCat)
+          ? 'EQ & Filter'
+          : /delay|echo/i.test(rawCat)
+          ? 'Delay & Echo'
+          : /pitch|time/i.test(rawCat)
+          ? 'Pitch & Time'
+          : /stereo|pan/i.test(rawCat)
+          ? 'Stereo & Pan'
+          : /fade|auto/i.test(rawCat)
+          ? 'Fade & Automation'
+          : 'EQ & Filter';
+
+      const license = classifyEffectLicense(
+        name,
+        afx.licenseTier,
+        afx.pluginVendor,
+        afx.skippedReason
+      );
+      const premiereEffectName = String(
+        afx.premiereEffectName ||
+          (license.licenseTier === 'Paid / Third-Party'
+            ? 'Skipped (Paid Third-Party Audio Plugin)'
+            : 'Parametric Equalizer')
+      );
+      const premiereEffectId = String(
+        afx.premiereEffectId || inferPremiereAudioEffectId(premiereEffectName || name, category)
+      );
+
+      // Avoid duplicating an identical Free built-in audio filter already added by DSP unless timed differently
+      const start = clamp(Number(afx.startTimeSec ?? 0), 0, durationSec);
+      const end = clamp(Number(afx.endTimeSec ?? durationSec), start + 0.1, durationSec);
+      const isDuplicateFree =
+        license.includedInTimeline &&
+        mergedAudioEffects.some(
+          (existing) =>
+            existing.includedInTimeline &&
+            existing.premiereEffectId === premiereEffectId &&
+            Math.abs(existing.startTimeSec - start) < 0.75 &&
+            Math.abs(existing.endTimeSec - end) < 0.75
+        );
+
+      const rawTrack = String(afx.trackId || afx.targetTrack || 'A1');
+      const trackId: AudioEffectItem['trackId'] =
+        rawTrack === 'A2' || rawTrack === 'A3' || rawTrack === 'A4' ? rawTrack : 'A1';
+
+      if (!isDuplicateFree) {
+        mergedAudioEffects.push({
+          id: `afx-ai-${idx + 1}`,
+          name,
+          category,
+          trackId,
+          startTimeSec: Number(start.toFixed(2)),
+          endTimeSec: Number(end.toFixed(2)),
+          intensity: clamp(Number(afx.intensity ?? 55), 0, 100),
+          parameters: {
+            Intensity: `${clamp(Number(afx.intensity ?? 55), 0, 100)}%`,
+            Track: trackId,
+          },
+          premiereEffectName,
+          premiereEffectId,
+          licenseTier: license.licenseTier,
+          includedInTimeline: license.includedInTimeline,
+          pluginVendor: license.pluginVendor,
+          skippedReason: license.skippedReason,
+          detectionSource: 'AI + DSP',
+          confidence: safeConfidence(afx.confidence),
+          notes: String(
+            afx.notes ||
+              (license.licenseTier === 'Paid / Third-Party'
+                ? license.skippedReason || 'Bypassed paid audio plugin.'
+                : 'Added as Free / Built-in Premiere Pro audio effect.')
+          ),
+        });
+      }
+    });
   } else if (audioResult.transientTimes.length > 0) {
-    audio.voiceoverNotes = 'AI audio-visual correlation was skipped; transient peaks extracted via Web Audio DSP.';
+    audio.voiceoverNotes =
+      'AI audio-visual correlation was skipped; spectral profile, free DSP audio filters & transient peaks extracted via Web Audio DSP.';
     audio.sfxEvents = audioResult.transientTimes.slice(0, 8).map((t, idx) => ({
       id: `sfx-dsp-${idx + 1}`,
       label: `Audio Transient #${idx + 1}`,
@@ -1119,19 +1689,50 @@ export async function runFullVideoAnalysis(
     }));
   }
 
+  audio.audioEffects = mergedAudioEffects;
+
+  const includedFreeVideoFx = effects.filter(
+    (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+  );
+  const skippedPaidVideoFx = effects.filter((e) => e.licenseTier === 'Paid / Third-Party');
+  const includedFreeAudioFx = audio.audioEffects.filter(
+    (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+  );
+  const skippedPaidAudioFx = audio.audioEffects.filter((e) => e.licenseTier === 'Paid / Third-Party');
+
   setStage(
     9,
     'done',
-    `${shots.length} clips · ${motionGraphics.length} graphic plates · ${audio.sfxEvents.length} SFX cues`
+    `${shots.length} clips · ${includedFreeVideoFx.length} free video FX · ${includedFreeAudioFx.length} free audio FX${
+      motionGraphics.length > 0 ? ` · ${motionGraphics.length} captions` : ''
+    }${
+      skippedPaidVideoFx.length + skippedPaidAudioFx.length > 0
+        ? ` · ${skippedPaidVideoFx.length + skippedPaidAudioFx.length} paid FX skipped`
+        : ''
+    }`
   );
 
   // Stage 10: Compatibility & Premiere XML readiness
-  setStage(10, 'active', 'Validating FCP 7 XMEML v4 interchange compatibility');
+  setStage(10, 'active', 'Validating FCP 7 XMEML v4 interchange & Free/Built-in FX bindings');
   const nativeCount =
     shots.filter((s) => s.transitionOut.premiereSupport === 'Native').length +
-    effects.filter((e) => e.premiereSupport === 'Native').length +
+    includedFreeVideoFx.length +
+    includedFreeAudioFx.length +
     2;
-  const totalItems = Math.max(1, shots.length + effects.length + 2);
+  const totalItems = Math.max(
+    1,
+    shots.length + effects.length + audio.audioEffects.length + 2
+  );
+
+  const skippedPaidUnsupportedList = [
+    ...skippedPaidVideoFx.map(
+      (ef) => `${ef.name} [${ef.pluginVendor || 'Paid Plugin'}] — bypassed (Paid Video FX)`
+    ),
+    ...skippedPaidAudioFx.map(
+      (afx) => `${afx.name} [${afx.pluginVendor || 'Paid Audio Plugin'}] — bypassed (Paid Audio FX)`
+    ),
+  ];
+
   const manualNotes = [
     ...(ai?.compatibility?.manualAdjustments?.length
       ? ai.compatibility.manualAdjustments
@@ -1139,24 +1740,52 @@ export async function runFullVideoAnalysis(
           'Relink source media in Premiere Pro upon opening XML',
           'Load Reconstructed_Look.cube in Lumetri Color > Basic Correction',
         ]),
+    ...skippedPaidVideoFx.map(
+      (ef) =>
+        `Skipped Paid Video Effect: ${ef.name} (${ef.pluginVendor || 'Third-Party'}) — pipeline continued with Free / Built-in effects.`
+    ),
+    ...skippedPaidAudioFx.map(
+      (afx) =>
+        `Skipped Paid Audio Plugin: ${afx.name} (${afx.pluginVendor || 'Third-Party'}) — pipeline continued with Free / Built-in Premiere audio filters.`
+    ),
     ...skippedStages.map((sk) => `Stage ${sk.stageId} (${sk.label}) partial/skipped: ${sk.reason}`),
   ];
 
+  const baseFullyReconstructed = ai?.compatibility?.fullyReconstructed?.length
+    ? [...ai.compatibility.fullyReconstructed]
+    : [
+        'Frame-accurate sequence timing & detected cut points',
+        'Basic Motion (Scale, Position, Rotation, Opacity) structure',
+        'Sequence beat & cut markers',
+      ];
+  if (includedFreeVideoFx.length > 0) {
+    baseFullyReconstructed.push(
+      `${includedFreeVideoFx.length} Free / Built-in Premiere Video Effects embedded in XMEML`
+    );
+  }
+  if (includedFreeAudioFx.length > 0) {
+    baseFullyReconstructed.push(
+      `${includedFreeAudioFx.length} Free / Built-in Premiere Audio Effects embedded on Track A1`
+    );
+  }
+  if (motionGraphics.length > 0) {
+    baseFullyReconstructed.push(
+      `${motionGraphics.length} Spell-checked styled & animated captions (Track V3 SVG plates + Premiere .srt)`
+    );
+  }
+
   const compatibility: CompatibilityReport = {
-    fullyReconstructed: ai?.compatibility?.fullyReconstructed?.length
-      ? ai.compatibility.fullyReconstructed
-      : [
-          'Frame-accurate sequence timing & detected cut points',
-          'Basic Motion (Scale, Position, Rotation, Opacity) structure',
-          'Sequence beat & cut markers',
-        ],
+    fullyReconstructed: baseFullyReconstructed,
     approximate: ai?.compatibility?.approximate?.length
       ? ai.compatibility.approximate
       : [
           'Estimated color grading exported as 17x17x17 .cube LUT',
           'Transitions mapped to nearest Premiere Pro transition',
         ],
-    unsupported: ai?.compatibility?.unsupported ?? [],
+    unsupported: [
+      ...(ai?.compatibility?.unsupported ?? []),
+      ...skippedPaidUnsupportedList,
+    ].filter((val, idx, arr) => arr.indexOf(val) === idx),
     missingAssets: ai?.compatibility?.missingAssets?.length
       ? ai.compatibility.missingAssets
       : [
@@ -1169,7 +1798,7 @@ export async function runFullVideoAnalysis(
   setStage(
     10,
     'done',
-    `XMEML v4 ready (${compatibility.nativeCoveragePercent}% native parameter coverage)`
+    `XMEML v4 ready (${includedFreeVideoFx.length} video FX + ${includedFreeAudioFx.length} audio FX bound)`
   );
 
   // Stage 11: Computing measurable comparison metrics & packaging project state

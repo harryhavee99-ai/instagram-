@@ -151,6 +151,40 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
                     {result.metadata?.aspectRatio || '9:16'}
                   </div>
                 </div>
+                <div>
+                  <div className="text-[11px] text-[#7F869B]">Metadata Source</div>
+                  <div className="text-white mt-0.5">
+                    {result.oEmbedAvailable
+                      ? 'Official Meta oEmbed'
+                      : result.metadata?.publicMetaExtracted
+                      ? 'Public OpenGraph Metadata'
+                      : 'Normalized URL Structure'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-[#7F869B]">Link Query Context</div>
+                  <div className="font-mono text-[#A5ACBF] mt-0.5 truncate">
+                    {result.metadata?.queryParamsDetected?.length
+                      ? result.metadata.queryParamsDetected.join(', ')
+                      : 'Clean canonical URL'}
+                  </div>
+                </div>
+                {(result.metadata?.caption || result.metadata?.title) && (
+                  <div className="col-span-2">
+                    <div className="text-[11px] text-[#7F869B]">Extracted Public Caption / Title</div>
+                    <div className="text-[#D4D8E3] mt-0.5 leading-relaxed line-clamp-3">
+                      {result.metadata.caption || result.metadata.title}
+                    </div>
+                  </div>
+                )}
+                {result.metadata?.hashtags && result.metadata.hashtags.length > 0 && (
+                  <div className="col-span-2">
+                    <div className="text-[11px] text-[#7F869B]">Detected Hashtags (Fed to AI Context)</div>
+                    <div className="text-[12px] font-mono text-[#9B82FF] mt-0.5 break-words">
+                      {result.metadata.hashtags.join('  ')}
+                    </div>
+                  </div>
+                )}
                 <div className="col-span-2">
                   <div className="text-[11px] text-[#7F869B]">Direct Video Stream Access</div>
                   <div className="text-[#FDE68A] mt-0.5">

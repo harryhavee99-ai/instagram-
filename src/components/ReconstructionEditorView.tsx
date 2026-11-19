@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import type {
+  CaptionStylePreset,
   ColorGradeSettings,
   EffectItem,
   MotionGraphicItem,
@@ -8,6 +9,11 @@ import type {
   ShotClip,
   ShotTransition,
 } from '../types/project';
+import {
+  CAPTION_ANIMATION_OPTIONS,
+  CAPTION_PRESET_NAMES,
+  CAPTION_STYLE_PRESETS,
+} from '../engine/captionPresets';
 import { formatShortSec, formatSmpte } from '../engine/formatters';
 import { MultitrackTimeline } from './MultitrackTimeline';
 import { MonitorViewMode, VideoMonitor } from './VideoMonitor';
@@ -330,7 +336,7 @@ export const ReconstructionEditorView: React.FC<ReconstructionEditorViewProps> =
                 ['clip', 'Clip & FX'],
                 ['color', 'Color'],
                 ['keyframes', 'Keyframes'],
-                ['text', 'Titles'],
+                ['text', 'Captions'],
               ] as const
             ).map(([id, label]) => (
               <button
@@ -614,7 +620,12 @@ export const ReconstructionEditorView: React.FC<ReconstructionEditorViewProps> =
                 {activeGraphic ? (
                   <>
                     <div className="space-y-1">
-                      <label className="text-[11px] text-[#7F869B]">Title Text</label>
+                      <div className="flex items-center justify-between text-[11px]">
+                        <label className="text-[#7F869B]">Caption Text</label>
+                        {activeGraphic.spellChecked && (
+                          <span className="text-[#4ADE80]">Spellcheck Verified</span>
+                        )}
+                      </div>
                       <input
                         type="text"
                         value={activeGraphic.text}
@@ -624,6 +635,115 @@ export const ReconstructionEditorView: React.FC<ReconstructionEditorViewProps> =
                         className="w-full h-8 px-2.5 rounded bg-[#0B0C10] border border-white/[0.1] text-white"
                       />
                     </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-[#7F869B]">Caption Style Preset</label>
+                      <select
+                        value={activeGraphic.captionStylePreset || 'Bold Hormozi'}
+                        onChange={(e) => {
+                          const preset = e.target.value as CaptionStylePreset;
+                          onUpdateGraphic(activeGraphic.id, CAPTION_STYLE_PRESETS[preset].patch);
+                        }}
+                        className="w-full h-8 px-2 rounded bg-[#0B0C10] border border-white/[0.1] text-white"
+                      >
+                        {CAPTION_PRESET_NAMES.map((presetName) => (
+                          <option key={presetName} value={presetName}>
+                            {presetName}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-[#7F869B]">Caption Animation</label>
+                      <select
+                        value={activeGraphic.animationType}
+                        onChange={(e) =>
+                          onUpdateGraphic(activeGraphic.id, {
+                            animationType: e.target.value as MotionGraphicItem['animationType'],
+                          })
+                        }
+                        className="w-full h-8 px-2 rounded bg-[#0B0C10] border border-white/[0.1] text-white"
+                      >
+                        {CAPTION_ANIMATION_OPTIONS.map((anim) => (
+                          <option key={anim} value={anim}>
+                            {anim === 'None' ? 'Static' : anim}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <label className="text-[11px] text-[#7F869B]">Highlight Word</label>
+                        <input
+                          type="text"
+                          placeholder="Keyword"
+                          value={activeGraphic.highlightWord || ''}
+                          onChange={(e) =>
+                            onUpdateGraphic(activeGraphic.id, {
+                              highlightWord: e.target.value || undefined,
+                            })
+                          }
+                          className="w-full h-8 px-2 rounded bg-[#0B0C10] border border-white/[0.1] text-white"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[11px] text-[#7F869B]">Text Case</label>
+                        <select
+                          value={activeGraphic.textTransform || 'none'}
+                          onChange={(e) =>
+                            onUpdateGraphic(activeGraphic.id, {
+                              textTransform: e.target.value as MotionGraphicItem['textTransform'],
+                            })
+                          }
+                          className="w-full h-8 px-2 rounded bg-[#0B0C10] border border-white/[0.1] text-white"
+                        >
+                          <option value="uppercase">UPPERCASE</option>
+                          <option value="capitalize">Capitalize</option>
+                          <option value="none">Normal</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 pt-1">
+                      <label className="flex items-center gap-1.5 text-[11px] text-[#A5ACBF]">
+                        <input
+                          type="color"
+                          value={activeGraphic.colorHex}
+                          onChange={(e) =>
+                            onUpdateGraphic(activeGraphic.id, { colorHex: e.target.value })
+                          }
+                          className="w-6 h-6 rounded bg-transparent border border-white/[0.15] cursor-pointer"
+                        />
+                        <span>Text</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-[#A5ACBF]">
+                        <input
+                          type="color"
+                          value={activeGraphic.highlightColorHex || '#FACC15'}
+                          onChange={(e) =>
+                            onUpdateGraphic(activeGraphic.id, { highlightColorHex: e.target.value })
+                          }
+                          className="w-6 h-6 rounded bg-transparent border border-white/[0.15] cursor-pointer"
+                        />
+                        <span>Highlight</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-[#A5ACBF]">
+                        <input
+                          type="color"
+                          value={activeGraphic.backgroundColorHex || '#000000'}
+                          onChange={(e) =>
+                            onUpdateGraphic(activeGraphic.id, {
+                              backgroundColorHex: e.target.value,
+                            })
+                          }
+                          className="w-6 h-6 rounded bg-transparent border border-white/[0.15] cursor-pointer"
+                        />
+                        <span>Box</span>
+                      </label>
+                    </div>
+
                     <div className="space-y-1">
                       <div className="flex justify-between">
                         <span className="text-[#A5ACBF]">Vertical Position</span>
@@ -644,6 +764,7 @@ export const ReconstructionEditorView: React.FC<ReconstructionEditorViewProps> =
                         className="w-full"
                       />
                     </div>
+
                     <div className="space-y-1">
                       <div className="flex justify-between">
                         <span className="text-[#A5ACBF]">Font Size</span>
@@ -662,10 +783,54 @@ export const ReconstructionEditorView: React.FC<ReconstructionEditorViewProps> =
                         className="w-full"
                       />
                     </div>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between">
+                        <span className="text-[#A5ACBF]">Outline Width</span>
+                        <span className="font-mono text-white">
+                          {activeGraphic.outlineWidthPx ?? 2}px
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={10}
+                        value={activeGraphic.outlineWidthPx ?? 2}
+                        onChange={(e) =>
+                          onUpdateGraphic(activeGraphic.id, {
+                            outlineWidthPx: Number(e.target.value),
+                          })
+                        }
+                        className="w-full"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between">
+                        <span className="text-[#A5ACBF]">Background Box Opacity</span>
+                        <span className="font-mono text-white">
+                          {activeGraphic.backgroundOpacity ?? 0}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={5}
+                        value={activeGraphic.backgroundOpacity ?? 0}
+                        onChange={(e) =>
+                          onUpdateGraphic(activeGraphic.id, {
+                            backgroundOpacity: Number(e.target.value),
+                          })
+                        }
+                        className="w-full"
+                      />
+                    </div>
                   </>
                 ) : (
                   <p className="text-[#7F869B]">
-                    No text layer selected. Add a title from the left Graphics panel.
+                    No caption layer selected. Add a caption from the left Graphics panel or click
+                    one on Track V3.
                   </p>
                 )}
               </div>

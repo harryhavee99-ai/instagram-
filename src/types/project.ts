@@ -16,6 +16,7 @@ export type NavPage =
 
 export type ConfidenceLevel = 'High' | 'Medium' | 'Low';
 export type CompatibilityStatus = 'Native' | 'Approximate' | 'Unsupported';
+export type EffectLicenseTier = 'Free / Built-in' | 'Paid / Third-Party';
 
 export interface InstagramInspectResult {
   valid: boolean;
@@ -29,6 +30,8 @@ export interface InstagramInspectResult {
   directVideoAvailable: boolean;
   metadata?: {
     title?: string;
+    caption?: string;
+    hashtags?: string[];
     authorName?: string;
     authorUrl?: string;
     thumbnailUrl?: string;
@@ -37,6 +40,8 @@ export interface InstagramInspectResult {
     providerName?: string;
     aspectRatio?: string;
     estimatedDurationSec?: number;
+    publicMetaExtracted?: boolean;
+    queryParamsDetected?: string[];
   };
   accessNotice: string;
   error?: string;
@@ -166,7 +171,7 @@ export interface ShotClip {
 export interface EffectItem {
   id: string;
   name: string;
-  category: 'Transition' | 'Motion' | 'Blur' | 'Stylize' | 'Light' | 'Speed' | 'Mask';
+  category: 'Transition' | 'Motion' | 'Blur' | 'Stylize' | 'Light' | 'Speed' | 'Mask' | 'Distort' | 'Color';
   shotId?: string;
   startTimeSec: number;
   endTimeSec: number;
@@ -175,15 +180,84 @@ export interface EffectItem {
   direction: string;
   parameters: Record<string, string | number>;
   confidence: ConfidenceLevel;
+  licenseTier: EffectLicenseTier;
+  includedInTimeline: boolean;
+  pluginVendor?: string;
+  skippedReason?: string;
   premiereSupport: CompatibilityStatus;
   premiereEffectName: string;
+  premiereEffectId?: string;
   approximationNote: string;
 }
+
+export interface AudioEffectItem {
+  id: string;
+  name: string;
+  category:
+    | 'EQ & Filter'
+    | 'Dynamics'
+    | 'Reverb'
+    | 'Delay & Echo'
+    | 'Pitch & Time'
+    | 'Noise Reduction'
+    | 'Stereo & Pan'
+    | 'Fade & Automation';
+  trackId: 'A1' | 'A2' | 'A3' | 'A4';
+  startTimeSec: number;
+  endTimeSec: number;
+  intensity: number; // 0-100
+  parameters: Record<string, string | number>;
+  licenseTier: EffectLicenseTier;
+  includedInTimeline: boolean;
+  pluginVendor?: string;
+  skippedReason?: string;
+  premiereEffectName: string;
+  premiereEffectId: string;
+  detectionSource?: 'Web Audio DSP' | 'AI + DSP';
+  confidence: ConfidenceLevel;
+  notes: string;
+}
+
+export interface AudioSpectralProfile {
+  subBassEnergy: number; // 0-100 (20-80 Hz)
+  bassEnergy: number; // 0-100 (80-250 Hz)
+  midEnergy: number; // 0-100 (250-3500 Hz)
+  highEnergy: number; // 0-100 (3500-16000 Hz)
+  integratedRmsDb: number; // approx dBFS
+  peakDb: number;
+  dynamicRangeDb: number;
+  stereoWidthPercent: number; // 0 mono .. 100 wide
+  reverbTailEstimate: 'Dry' | 'Subtle Room' | 'Medium Hall' | 'Heavy Wash';
+  lowPassFilterDetected: boolean;
+  sidechainOrDuckingDetected: boolean;
+}
+
+export type CaptionStylePreset =
+  | 'Bold Hormozi'
+  | 'Karaoke Highlight'
+  | 'Boxed Pill'
+  | 'Neon Glow'
+  | 'Outline Impact'
+  | 'Minimal Clean'
+  | 'Typewriter Mono';
+
+export type CaptionAnimationType =
+  | 'None'
+  | 'Fade'
+  | 'Pop In'
+  | 'Bounce Pop'
+  | 'Slide Up'
+  | 'Kinetic Scale'
+  | 'Word Highlight'
+  | 'Karaoke Sweep'
+  | 'Typewriter'
+  | 'Glow Pulse';
 
 export interface MotionGraphicItem {
   id: string;
   text: string;
   type: 'Title' | 'Subtitle' | 'Caption' | 'Lower Third' | 'Callout' | 'Logo' | 'Shape';
+  isCaption?: boolean;
   trackId: 'V3';
   startTimeSec: number;
   endTimeSec: number;
@@ -194,9 +268,17 @@ export interface MotionGraphicItem {
   positionYPercent: number; // 0-100
   colorHex: string;
   outlineColorHex: string;
+  outlineWidthPx?: number;
+  backgroundColorHex?: string;
+  backgroundOpacity?: number; // 0-100
+  highlightColorHex?: string;
+  highlightWord?: string;
+  textTransform?: 'none' | 'uppercase' | 'capitalize';
+  captionStylePreset?: CaptionStylePreset;
   hasShadow: boolean;
-  animationType: 'None' | 'Fade' | 'Pop In' | 'Slide Up' | 'Kinetic Scale' | 'Typewriter';
+  animationType: CaptionAnimationType;
   animationDurationSec: number;
+  spellChecked?: boolean;
   confidence: ConfidenceLevel;
   fontSubstituteNote: string;
 }
@@ -254,6 +336,8 @@ export interface AudioAnalysis {
   beats: BeatMarker[];
   sections: AudioSection[];
   sfxEvents: SfxEvent[];
+  audioEffects: AudioEffectItem[];
+  spectralProfile?: AudioSpectralProfile;
   musicDescription: string;
   voiceoverDetected: boolean;
   voiceoverNotes: string;

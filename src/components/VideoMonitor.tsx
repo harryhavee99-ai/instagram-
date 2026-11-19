@@ -8,6 +8,7 @@ import {
   VolumeX,
 } from 'lucide-react';
 import type { ReelProject, ShotClip } from '../types/project';
+import { hexToRgba } from '../engine/captionPresets';
 import { buildColorFilterCss, clamp, formatSmpte } from '../engine/formatters';
 
 export type MonitorViewMode = 'original' | 'reconstructed' | 'split' | 'side-by-side';
@@ -265,38 +266,130 @@ export const VideoMonitor: React.FC<VideoMonitorProps> = ({
           />
         )}
 
-        {/* Reconstructed Editable Motion Graphics / OCR Text Layer */}
+        {/* Reconstructed Editable Captions & Motion Graphics Layer (Track V3) */}
         {styledRecon &&
           activeGraphics.map((g) => {
-            const rel = currentTimeSec - g.startTimeSec;
-            const animP = clamp(rel / Math.max(0.05, g.animationDurationSec), 0, 1);
-            const gOpacity = g.animationType === 'Fade' ? animP : 1;
-            const gScale =
-              g.animationType === 'Pop In' || g.animationType === 'Kinetic Scale'
-                ? 0.8 + animP * 0.2
-                : 1;
-            const gTranslateY = g.animationType === 'Slide Up' ? (1 - animP) * 18 : 0;
+            const cueDur = Math.max(0.15, g.endTimeSec - g.startTimeSec);
+            const rel = clamp(currentTimeSec - g.startTimeSec, 0, cueDur);
+            const animP = clamp(rel / Math.max(0.05, g.animationDurationSec || 0.28), 0, 1);
+
+            const gOpacity =
+              g.animationType === 'Fade' || g.animationType === 'Slide Up' ? animP : 1;
+
+            let gScale = 1;
+            if (g.animationType === 'Bounce Pop') {
+              // Elastic spring overshoot: 0.62 -> 1.14 -> 1.0
+              gScale =
+                animP < 0.65
+                  ? 0.62 + (animP / 0.65) * 0.52
+                  : 1.14 - ((animP - 0.65) / 0.35) * 0.14;
+            } else if (g.animationType === 'Pop In' || g.animationType === 'Kinetic Scale') {
+              const eased = 1 - Math.pow(1 - animP, 3);
+              gScale = 0.78 + eased * 0.22;
+            }
+
+            const gTranslateY =
+              g.animationType === 'Slide Up' ? (1 - (1 - Math.pow(1 - animP, 2))) * 22 : 0;
+
+            const isNeon =
+              g.captionStylePreset === 'Neon Glow' || g.animationType === 'Glow Pulse';
+            const pulseGlow = isNeon ? 10 + Math.sin(rel * 8) * 5 : 0;
+
+            const textShadow = isNeon
+              ? `0 0 ${Math.round(pulseGlow)}px ${g.outlineColorHex || '#7C5CFF'}, 0 0 ${Math.round(pulseGlow * 2)}px ${g.highlightColorHex || '#38BDF8'}, 0 2px 6px rgba(0,0,0,0.85)`
+              : g.hasShadow
+              ? '0 3px 12px rgba(0,0,0,0.9), 0 1px 3px rgba(0,0,0,0.95)'
+              : 'none';
+
+            const bgRgba = hexToRgba(g.backgroundColorHex, g.backgroundOpacity);
+            const hasBg = (g.backgroundOpacity ?? 0) > 0;
+            const strokePx = Math.max(
+              0,
+              Number(((g.outlineWidthPx ?? 2) * (compact ? 0.32 : 0.45)).toFixed(2))
+            );
+
+            const rawText = g.text.trim();
+            const fullText =
+              g.textTransform === 'uppercase'
+                ? rawText.toUpperCase()
+                : g.textTransform === 'capitalize'
+                ? rawText.replace(/\b\w/g, (c) => c.toUpperCase())
+                : rawText;
+
+            const displayString =
+              g.animationType === 'Typewriter'
+                ? fullText.slice(
+                    0,
+                    Math.max(1, Math.ceil((rel / Math.max(0.25, cueDur * 0.75)) * fullText.length))
+                  )
+                : fullText;
+
+            const words = displayString.split(/\s+/).filter(Boolean);
+            const activeKaraokeIndex =
+              g.animationType === 'Karaoke Sweep' && words.length > 0
+                ? Math.min(words.length - 1, Math.floor((rel / cueDur) * words.length))
+                : -1;
+            const normHighlight = g.highlightWord
+              ? g.highlightWord.trim().toLowerCase().replace(/[^a-z0-9]/gi, '')
+              : '';
 
             return (
               <div
                 key={g.id}
-                className="pointer-events-none absolute px-2 text-center select-none"
+                className="pointer-events-none absolute text-center select-none"
                 style={{
                   left: `${g.positionXPercent}%`,
                   top: `${g.positionYPercent}%`,
-                  transform: `translate(-50%, -50%) translateY(${gTranslateY}px) scale(${gScale})`,
+                  maxWidth: '88%',
+                  transform: `translate(-50%, -50%) translateY(${gTranslateY.toFixed(1)}px) scale(${gScale.toFixed(3)})`,
                   opacity: gOpacity,
                   color: g.colorHex,
                   fontFamily: `${g.fontFamily}, Outfit, sans-serif`,
                   fontWeight: g.fontWeight,
-                  fontSize: `${Math.max(12, Math.round(g.fontSize * (compact ? 0.42 : 0.56)))}px`,
-                  textShadow: g.hasShadow ? '0 3px 12px rgba(0,0,0,0.85)' : 'none',
-                  WebkitTextStroke: g.outlineColorHex ? `0.7px ${g.outlineColorHex}` : undefined,
-                  lineHeight: 1.15,
-                  whiteSpace: 'nowrap',
+                  fontSize: `${Math.max(12, Math.round(g.fontSize * (compact ? 0.4 : 0.54)))}px`,
+                  textShadow,
+                  WebkitTextStroke:
+                    strokePx > 0 && g.outlineColorHex
+                      ? `${strokePx}px ${g.outlineColorHex}`
+                      : undefined,
+                  paintOrder: 'stroke fill',
+                  backgroundColor: hasBg ? bgRgba : 'transparent',
+                  padding: hasBg ? (compact ? '3px 8px' : '5px 12px') : '0 6px',
+                  borderRadius: hasBg ? '8px' : undefined,
+                  lineHeight: 1.18,
+                  whiteSpace: 'pre-wrap',
                 }}
               >
-                {g.text}
+                {words.length > 0 &&
+                (g.animationType === 'Karaoke Sweep' ||
+                  g.animationType === 'Word Highlight' ||
+                  normHighlight.length > 0) ? (
+                  words.map((word, wIdx) => {
+                    const cleanWord = word.toLowerCase().replace(/[^a-z0-9]/gi, '');
+                    const isKaraokeHit =
+                      g.animationType === 'Karaoke Sweep' && wIdx === activeKaraokeIndex;
+                    const isKeywordHit = normHighlight.length > 0 && cleanWord === normHighlight;
+                    const isActiveWord = isKaraokeHit || isKeywordHit;
+
+                    return (
+                      <React.Fragment key={`${g.id}-w-${wIdx}`}>
+                        <span
+                          style={{
+                            color: isActiveWord ? g.highlightColorHex || '#FACC15' : undefined,
+                            display: 'inline-block',
+                            transform: isActiveWord ? 'scale(1.08)' : 'scale(1)',
+                            transition: 'transform 90ms ease-out, color 90ms ease-out',
+                          }}
+                        >
+                          {word}
+                        </span>
+                        {wIdx < words.length - 1 ? ' ' : ''}
+                      </React.Fragment>
+                    );
+                  })
+                ) : (
+                  displayString
+                )}
               </div>
             );
           })}

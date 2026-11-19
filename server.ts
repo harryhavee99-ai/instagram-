@@ -100,6 +100,7 @@ function parseInstagramUrl(rawUrl: string) {
     typeSegment === 'p' ? 'Video Post' : typeSegment === 'tv' ? 'IGTV' : 'Reel';
   const canonicalType = typeSegment === 'reels' ? 'reel' : typeSegment;
   const normalizedUrl = `https://www.instagram.com/${canonicalType}/${shortcode}/`;
+  const queryParamsDetected = Array.from(parsed.searchParams.keys());
 
   return {
     valid: true,
@@ -107,7 +108,78 @@ function parseInstagramUrl(rawUrl: string) {
     shortcode,
     contentType,
     creatorHandle,
+    queryParamsDetected,
   };
+}
+
+function decodeHtmlEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+}
+
+async function fetchPublicOpenGraphMetadata(normalizedUrl: string): Promise<{
+  title?: string;
+  caption?: string;
+  hashtags?: string[];
+  thumbnailUrl?: string;
+  authorName?: string;
+  publicMetaExtracted: boolean;
+}> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch(normalizedUrl, {
+      signal: controller.signal,
+      headers: {
+        Accept: 'text/html',
+        'User-Agent': 'Reel2PremiereAI-MetadataInspector/1.0',
+      },
+      redirect: 'follow',
+    });
+    clearTimeout(timer);
+    if (!res.ok) return { publicMetaExtracted: false };
+
+    const html = (await res.text()).slice(0, 65000);
+    const extractMeta = (prop: string) => {
+      const m =
+        html.match(new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i')) ||
+        html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${prop}["']`, 'i')) ||
+        html.match(new RegExp(`<meta[^>]+name=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i'));
+      return m ? decodeHtmlEntities(m[1]).trim() : undefined;
+    };
+
+    const ogTitle = extractMeta('og:title');
+    const ogDesc = extractMeta('og:description') || extractMeta('description');
+    const ogImage = extractMeta('og:image');
+
+    // Avoid treating generic login wall pages as post metadata
+    const combined = `${ogTitle ?? ''} ${ogDesc ?? ''}`.toLowerCase();
+    if (!ogTitle && !ogDesc) return { publicMetaExtracted: false };
+    if (combined.includes('login') && combined.includes('instagram') && !ogImage) {
+      return { publicMetaExtracted: false };
+    }
+
+    const hashtags = Array.from(new Set((ogDesc ?? '').match(/#[A-Za-z0-9_]+/g) ?? [])).slice(0, 12);
+    const creatorMatch = (ogTitle ?? '').match(/^([^on(]+?)\s+on\s+Instagram/i);
+    const authorName = creatorMatch ? creatorMatch[1].trim() : undefined;
+
+    return {
+      title: ogTitle,
+      caption: ogDesc,
+      hashtags,
+      thumbnailUrl: ogImage,
+      authorName,
+      publicMetaExtracted: Boolean(ogTitle || ogDesc || ogImage),
+    };
+  } catch {
+    return { publicMetaExtracted: false };
+  }
 }
 
 async function startServer() {
@@ -128,7 +200,7 @@ async function startServer() {
     });
   });
 
-  // Authorized Instagram URL validation + official Meta oEmbed metadata lookup
+  // Authorized Instagram URL validation + official Meta oEmbed & safe public OpenGraph metadata lookup
   app.post('/api/instagram/inspect', async (req, res) => {
     const rawUrl = String(req.body?.url ?? '');
     const parsed = parseInstagramUrl(rawUrl);
@@ -148,24 +220,33 @@ async function startServer() {
 
     const token = process.env.META_OEMBED_TOKEN;
     if (!token) {
+      // Attempt safe, non-authenticated public OpenGraph tag inspection (never bypasses private accounts or DRM)
+      const publicOg = await fetchPublicOpenGraphMetadata(parsed.normalizedUrl!);
+
       res.json({
         valid: true,
         url: rawUrl,
         normalizedUrl: parsed.normalizedUrl,
         shortcode: parsed.shortcode,
         contentType: parsed.contentType,
-        creatorHandle: parsed.creatorHandle,
+        creatorHandle: parsed.creatorHandle || (publicOg.authorName ? `@${publicOg.authorName.replace(/^@/, '')}` : undefined),
         oEmbedAvailable: false,
         oEmbedConfigured: false,
         directVideoAvailable: false,
         metadata: {
-          title: `Instagram ${parsed.contentType} (${parsed.shortcode})`,
-          authorName: parsed.creatorHandle ?? 'Creator metadata requires Meta oEmbed token',
+          title: publicOg.title || `Instagram ${parsed.contentType} (${parsed.shortcode})`,
+          caption: publicOg.caption,
+          hashtags: publicOg.hashtags,
+          authorName: publicOg.authorName || parsed.creatorHandle || 'Creator metadata requires Meta oEmbed token',
+          thumbnailUrl: publicOg.thumbnailUrl,
           providerName: 'Instagram',
           aspectRatio: parsed.contentType === 'Reel' ? '9:16 (Standard Reel)' : 'Variable',
+          publicMetaExtracted: publicOg.publicMetaExtracted,
+          queryParamsDetected: parsed.queryParamsDetected,
         },
-        accessNotice:
-          'Instagram URL validated. Official Meta oEmbed lookup requires META_OEMBED_TOKEN on the server, and Meta oEmbed never exposes raw downloadable video streams. Upload your authorized video file below to run full frame-by-frame reverse engineering.',
+        accessNotice: publicOg.publicMetaExtracted
+          ? 'Instagram URL validated and public OpenGraph metadata extracted. Meta oEmbed never exposes raw downloadable video files—attach your authorized video file below to run full frame-by-frame, audio DSP, and free-effect Premiere Pro reconstruction.'
+          : 'Instagram URL validated. Official Meta oEmbed lookup requires META_OEMBED_TOKEN on the server, and Meta oEmbed never exposes raw downloadable video streams. Upload your authorized video file below to run full reverse engineering.',
       });
       return;
     }
@@ -195,6 +276,7 @@ async function startServer() {
             authorName: parsed.creatorHandle ?? 'Unavailable (Private or Restricted)',
             providerName: 'Instagram',
             aspectRatio: parsed.contentType === 'Reel' ? '9:16' : 'Variable',
+            queryParamsDetected: parsed.queryParamsDetected,
           },
           accessNotice: `Meta oEmbed returned HTTP ${upstream.status}. The post may be private, deleted, or require elevated Meta App permissions. Private accounts and access controls are respected and never bypassed. Upload your authorized source video file to analyze it.`,
           error: errBody ? `Meta API: ${errBody.slice(0, 180)}` : undefined,
@@ -212,6 +294,7 @@ async function startServer() {
         provider_name?: string;
       };
 
+      const hashtags = Array.from(new Set((data.title ?? '').match(/#[A-Za-z0-9_]+/g) ?? [])).slice(0, 12);
       const aspectRatio =
         data.thumbnail_width && data.thumbnail_height
           ? `${data.thumbnail_width}:${data.thumbnail_height}`
@@ -231,6 +314,8 @@ async function startServer() {
         directVideoAvailable: false,
         metadata: {
           title: data.title || `Instagram ${parsed.contentType} (${parsed.shortcode})`,
+          caption: data.title,
+          hashtags,
           authorName: data.author_name || parsed.creatorHandle || 'Instagram Creator',
           authorUrl: data.author_url,
           thumbnailUrl: data.thumbnail_url,
@@ -238,9 +323,11 @@ async function startServer() {
           thumbnailHeight: data.thumbnail_height,
           providerName: data.provider_name || 'Instagram',
           aspectRatio,
+          publicMetaExtracted: true,
+          queryParamsDetected: parsed.queryParamsDetected,
         },
         accessNotice:
-          'Authorized Meta oEmbed metadata retrieved. Per Meta platform policy, oEmbed returns preview metadata only and does not provide the raw video file. Attach your authorized original video file below to run full frame-by-frame reverse engineering.',
+          'Authorized Meta oEmbed metadata retrieved. Per Meta platform policy, oEmbed returns preview metadata only and does not provide the raw video file. Attach your authorized original video file below to run full frame-by-frame and audio reverse engineering.',
       });
     } catch (err) {
       res.status(502).json({
@@ -259,7 +346,7 @@ async function startServer() {
     }
   });
 
-  // Server-side Gemini Multimodal Reverse-Engineering Analysis
+  // Server-side Gemini Multimodal Reverse-Engineering Analysis (Deep Visual FX + Free/Paid Filtering + Deep Audio FX)
   app.post('/api/analyze', async (req, res) => {
     const ai = getGeminiClient();
     if (!ai) {
@@ -280,8 +367,8 @@ async function startServer() {
       return;
     }
 
-    // Cap frames sent to Gemini (adaptive inspection: max 14 keyframe images)
-    const boundedKeyframes = keyframes.slice(0, 14) as Array<{
+    // Cap frames sent to Gemini (adaptive shot + caption cadence inspection: max 24 keyframe images)
+    const boundedKeyframes = keyframes.slice(0, 24) as Array<{
       shotIndex: number;
       timeSec: number;
       role: string;
@@ -312,6 +399,15 @@ async function startServer() {
         fps: metadata.fps,
         container: metadata.container,
         sourceUrl: sourceContext?.normalizedUrl || null,
+        instagramContext: sourceContext?.valid
+          ? {
+              contentType: sourceContext.contentType,
+              creatorHandle: sourceContext.creatorHandle,
+              title: sourceContext.metadata?.title,
+              caption: sourceContext.metadata?.caption,
+              hashtags: sourceContext.metadata?.hashtags,
+            }
+          : null,
       },
       cvDetectedShots: rawShots.map((s: Record<string, unknown>) => ({
         index: s.index,
@@ -320,6 +416,9 @@ async function startServer() {
         durationSec: s.durationSec,
         measuredMotionScore: s.measuredMotionScore,
         measuredCutDelta: s.measuredCutDelta,
+        flashSpikeDetected: s.flashSpikeDetected,
+        blurDropDetected: s.blurDropDetected,
+        chromaSpreadScore: s.chromaSpreadScore,
         beatAligned: s.beatAligned,
         alignedBeatTimeSec: s.alignedBeatTimeSec,
       })),
@@ -335,22 +434,42 @@ async function startServer() {
         transientCandidateTimes: audioMeasurements?.transientTimes ?? [],
         hasFadeIn: audioMeasurements?.hasFadeIn ?? false,
         hasFadeOut: audioMeasurements?.hasFadeOut ?? false,
+        spectralProfile: audioMeasurements?.spectralProfile ?? null,
       },
     };
 
-    const promptText = `You are a senior film editor, colorist, motion designer, and sound designer performing technical video reverse-engineering for Adobe Premiere Pro reconstruction.
+    const promptText = `You are a world-class film editor, VFX supervisor, colorist, motion designer, and audio mastering engineer performing deep reverse-engineering for Adobe Premiere Pro.
 
-Examine the attached adaptively sampled keyframes (each labeled with its exact shot number and timestamp) alongside the real computer-vision and Web Audio DSP measurements below:
+Examine ALL attached boundary and midpoint keyframes alongside the Instagram link context, per-shot computer-vision measurements, pixel color histograms, and Web Audio DSP spectral/dynamics telemetry below:
 
 ${JSON.stringify(technicalBrief, null, 2)}
 
-CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
-1. Return one shot analysis entry for EVERY shot in cvDetectedShots (exact matching index 0..N-1).
-2. Base your visual descriptions, framing, camera movement, transitions, lighting, and color profile strictly on what is actually visible in the provided keyframes and measured CV motion/histogram deltas.
-3. For motionGraphics (OCR text & graphics): ONLY report text, captions, titles, logos, or graphic shapes that are ACTUALLY VISIBLE in the attached keyframes. If NO text is visible in the video, return an empty array [] for motionGraphics. NEVER invent or hallucinate text overlays!
-4. Never falsely identify a copyrighted song title or artist from waveform/BPM alone. Describe musical feel/energy objectively (e.g., "Rhythmic 124 BPM electronic pulse") and clearly note if audio separation is estimated.
-5. Be honest about Adobe Premiere Pro native compatibility: mark hard cuts, cross dissolves, opacity fades, motion scale/position/rotation, Gaussian blur, and basic Lumetri adjustments as "Native"; mark whip pans, directional blur zoom transitions, light leaks, or glitch RGB splits as "Approximate" or "Unsupported" with clear Premiere alternatives.
-6. Provide realistic confidence levels ("High", "Medium", "Low") based on visual clarity and measurement agreement.`;
+CRITICAL RESEARCH & EFFECT RULES:
+1. Return one detailed shot entry for EVERY shot in cvDetectedShots (exact matching index 0..N-1).
+2. WIDE VISUAL EFFECTS RESEARCH & FREE VS PAID CLASSIFICATION:
+   - Search widely across every frame and shot transition for visual effects:
+     * FREE / BUILT-IN PREMIERE PRO EFFECTS (mark licenseTier = "Free / Built-in"):
+       Basic Motion (Zoom In/Out, Pan, Tilt, Rotation), Transform (Shutter Angle Motion Blur), Gaussian Blur, Directional Blur, Fast Box Blur, Sharpen / Unsharp Mask, Lumetri Color (Vignette, Film Fade, Exposure Flash), Dip to White / Dip to Black, Cross Dissolve, Film Dissolve, Slide / Push, Crop (Split-Screen / Cinematic Letterbox), Mirror, Offset, Posterize Time (Stop-Motion Frame Rate), VR Chromatic Aberrations (RGB Split), VR Digital Glitch, Strobe Light, Noise / Film Grain, Lens Distortion, Wave Warp, Tint, Invert, Echo, Time Remapping (Speed Ramp / Slow-Mo / Fast-Mo).
+     * PAID / THIRD-PARTY PLUGINS (mark licenseTier = "Paid / Third-Party"):
+       If you observe unmistakable proprietary paid plugin looks (such as Boris FX Sapphire S_Shake / S_Glow / S_Flicker, Red Giant Universe VHS / Holomatrix / Heatwave, Dehancer Pro Halation & Gate Weave, FilmConvert Nitrate, Twixtor Pro optical flow warp, RSMB ReelSmart Motion Blur, Deep Glow, Optical Flares, or paid preset packs), classify them honestly as "Paid / Third-Party" with pluginVendor and skippedReason. Our pipeline will automatically skip Paid effects and include ALL Free / Built-in effects cleanly!
+   - Identify ALL free/built-in visual effects actually supported by the frames and CV measurements (flashSpikeDetected, blurDropDetected, chromaSpreadScore, measuredMotionScore, vignette, fade, grain, speed changes).
+3. DEEP AUDIO ANALYSIS & AUDIO EFFECTS (FREE VS PAID):
+   - Analyze the Web Audio spectralProfile (subBassEnergy, bassEnergy, midEnergy, highEnergy, integratedRmsDb, dynamicRangeDb, stereoWidthPercent, reverbTailEstimate, lowPassFilterDetected, sidechainOrDuckingDetected), BPM, fades, and transientCandidateTimes.
+   - Return a comprehensive list of audioEffects used in the mix!
+     * FREE / BUILT-IN PREMIERE AUDIO EFFECTS (licenseTier = "Free / Built-in"):
+       Parametric Equalizer (premiereEffectId: "ParametricEqualizer"), Lowpass ("Lowpass"), Highpass ("Highpass"), Single-band Compressor ("SingleBandCompressor"), Hard Limiter ("HardLimiter"), Studio Reverb ("StudioReverb"), Analog Delay ("AnalogDelay"), DeNoise ("DeNoise"), Pitch Shifter ("PitchShifter"), Stereo Expander ("StereoExpander"), Exponential Fade / Audio Levels Automation ("audiolevels").
+     * PAID AUDIO PLUGINS (licenseTier = "Paid / Third-Party"): e.g., FabFilter Pro-Q, Valhalla VintageVerb, Waves L2, Soundtoys EchoBoy, Auto-Tune Pro — mark as "Paid / Third-Party" if clearly characteristic so the pipeline skips them cleanly while keeping all Free audio effects!
+4. CAPTIONS & OCR MOTION GRAPHICS (ZERO SPELLING MISTAKES + EXACT STYLE + ANIMATIONS):
+   - Carefully inspect EVERY SINGLE attached frame (including caption-cadence frames) for any burned-in captions, subtitles, karaoke word popups, hooks, or on-screen text.
+   - SPELLING ACCURACY IS MANDATORY: Read every word character-by-character, double-check spelling, grammar, and punctuation against visual evidence and sentence context so there are ZERO OCR typos or garbled characters! If a caption appears across consecutive frames, merge it into clean, non-overlapping chronological caption cues with accurate startTimeSec and endTimeSec.
+   - CAPTURE CAPTION STYLE ACCURATELY:
+     * Set isCaption = true and type = "Caption" (or "Subtitle") for spoken/dialogue captions; set isCaption = false for standalone titles/logos.
+     * Identify captionStylePreset from: "Bold Hormozi", "Karaoke Highlight", "Boxed Pill", "Neon Glow", "Outline Impact", "Minimal Clean", "Typewriter Mono".
+     * Measure exact visual styling: fontFamily (e.g. "Montserrat", "Outfit", "Anton", "Inter", "JetBrains Mono"), fontSize, fontWeight (400–900), colorHex (main text color), outlineColorHex & outlineWidthPx (stroke thickness 0–10), backgroundColorHex & backgroundOpacity (0 if no box, 65–95 if boxed pill/bar), highlightColorHex & highlightWord (if one word is highlighted in yellow/green/purple/red), textTransform ("uppercase" | "capitalize" | "none"), hasShadow (true/false), and exact positionXPercent & positionYPercent.
+   - CAPTURE CAPTION ANIMATION ACCURATELY:
+     * Choose animationType from: "Bounce Pop", "Word Highlight", "Karaoke Sweep", "Pop In", "Slide Up", "Kinetic Scale", "Typewriter", "Glow Pulse", "Fade", "None" based on how words appear/highlight across consecutive frames.
+   - ONLY report captions/text ACTUALLY VISIBLE in the attached frames. If there are genuinely no captions or text on screen, return []. NEVER fabricate text.
+5. Never falsely identify a copyrighted song name or artist. Describe audio objectively.`;
 
     parts.push({ text: promptText });
 
@@ -442,8 +561,12 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
               intensity: { type: Type.NUMBER },
               direction: { type: Type.STRING },
               confidence: { type: Type.STRING },
+              licenseTier: { type: Type.STRING },
+              pluginVendor: { type: Type.STRING },
+              skippedReason: { type: Type.STRING },
               premiereSupport: { type: Type.STRING },
               premiereEffectName: { type: Type.STRING },
+              premiereEffectId: { type: Type.STRING },
               approximationNote: { type: Type.STRING },
             },
             required: [
@@ -454,6 +577,7 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
               'intensity',
               'direction',
               'confidence',
+              'licenseTier',
               'premiereSupport',
               'premiereEffectName',
               'approximationNote',
@@ -467,14 +591,23 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
             properties: {
               text: { type: Type.STRING },
               type: { type: Type.STRING },
+              isCaption: { type: Type.BOOLEAN },
               startTimeSec: { type: Type.NUMBER },
               endTimeSec: { type: Type.NUMBER },
               fontFamily: { type: Type.STRING },
               fontSize: { type: Type.INTEGER },
+              fontWeight: { type: Type.INTEGER },
               positionXPercent: { type: Type.NUMBER },
               positionYPercent: { type: Type.NUMBER },
               colorHex: { type: Type.STRING },
               outlineColorHex: { type: Type.STRING },
+              outlineWidthPx: { type: Type.NUMBER },
+              backgroundColorHex: { type: Type.STRING },
+              backgroundOpacity: { type: Type.INTEGER },
+              highlightColorHex: { type: Type.STRING },
+              highlightWord: { type: Type.STRING },
+              textTransform: { type: Type.STRING },
+              captionStylePreset: { type: Type.STRING },
               hasShadow: { type: Type.BOOLEAN },
               animationType: { type: Type.STRING },
               animationDurationSec: { type: Type.NUMBER },
@@ -484,6 +617,7 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
             required: [
               'text',
               'type',
+              'isCaption',
               'startTimeSec',
               'endTimeSec',
               'fontFamily',
@@ -517,8 +651,42 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
                 required: ['label', 'category', 'timeSec', 'durationSec', 'linkedVisualEvent', 'confidence'],
               },
             },
+            audioEffects: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  category: { type: Type.STRING },
+                  trackId: { type: Type.STRING },
+                  startTimeSec: { type: Type.NUMBER },
+                  endTimeSec: { type: Type.NUMBER },
+                  intensity: { type: Type.NUMBER },
+                  licenseTier: { type: Type.STRING },
+                  pluginVendor: { type: Type.STRING },
+                  skippedReason: { type: Type.STRING },
+                  premiereEffectName: { type: Type.STRING },
+                  premiereEffectId: { type: Type.STRING },
+                  confidence: { type: Type.STRING },
+                  notes: { type: Type.STRING },
+                },
+                required: [
+                  'name',
+                  'category',
+                  'trackId',
+                  'startTimeSec',
+                  'endTimeSec',
+                  'intensity',
+                  'licenseTier',
+                  'premiereEffectName',
+                  'premiereEffectId',
+                  'confidence',
+                  'notes',
+                ],
+              },
+            },
           },
-          required: ['musicDescription', 'voiceoverDetected', 'voiceoverNotes', 'sfxEvents'],
+          required: ['musicDescription', 'voiceoverDetected', 'voiceoverNotes', 'sfxEvents', 'audioEffects'],
         },
         colorProfile: {
           type: Type.OBJECT,
@@ -557,10 +725,10 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
         contents: { parts },
         config: {
           systemInstruction:
-            'You are Reel2Premiere AI, a precise video editing reverse-engineering engine. Return strictly grounded JSON matching the schema. Never invent text overlays that do not appear in the frames.',
+            'You are Reel2Premiere AI, a thorough video, caption OCR, and audio reverse-engineering specialist. Research visual and audio effects widely. Strictly label Free/Built-in Adobe Premiere Pro effects as "Free / Built-in" and proprietary paid third-party plugins as "Paid / Third-Party". For visible captions and subtitles, verify every single word carefully for 100% accurate spelling (zero typos), exact visual style (colors, outline, background box, highlight word, casing), and caption animations. Never invent text not visible in the frames.',
           responseMimeType: 'application/json',
           responseSchema,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
         },
       });
 
@@ -583,6 +751,62 @@ CRITICAL RULES FOR HONEST TECHNICAL RECONSTRUCTION:
       res.status(status).json({
         error: `AI analysis error: ${msg}`,
       });
+    }
+  });
+
+  // Dedicated zero-typo caption spellcheck & proofreading pass (preserves timing & style)
+  app.post('/api/captions/proofread', async (req, res) => {
+    const ai = getGeminiClient();
+    if (!ai) {
+      res.status(503).json({
+        error: 'GEMINI_API_KEY is not configured on the server.',
+      });
+      return;
+    }
+
+    const { captions, context } = req.body ?? {};
+    if (!Array.isArray(captions) || captions.length === 0) {
+      res.status(400).json({ error: 'Provide a non-empty captions array to proofread.' });
+      return;
+    }
+
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `Proofread the following video captions extracted via OCR and fix ANY spelling mistakes, OCR letter confusions (e.g. l/I, 0/O, rn/m), duplicated spaces, or broken punctuation while strictly preserving the original language (English, Urdu/Roman Urdu, Hindi, etc.), tone, meaning, and exact item IDs. Also ensure highlightWord (if provided) matches an exact word in the corrected text.\n\nContext: ${JSON.stringify(context ?? {})}\n\nCaptions:\n${JSON.stringify(captions, null, 2)}`,
+        config: {
+          systemInstruction:
+            'You are a meticulous broadcast subtitle proofreader. Fix every spelling mistake with 100% accuracy while keeping the exact meaning, concise short-form pacing, and original language.',
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              captions: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    text: { type: Type.STRING },
+                    highlightWord: { type: Type.STRING },
+                    correctionNote: { type: Type.STRING },
+                  },
+                  required: ['id', 'text'],
+                },
+              },
+            },
+            required: ['captions'],
+          },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      });
+
+      const rawText = (response.text ?? '').trim();
+      const parsed = JSON.parse(rawText || '{"captions":[]}');
+      res.json({ ok: true, captions: parsed.captions ?? [] });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Caption proofreading failed.';
+      res.status(500).json({ error: msg });
     }
   });
 

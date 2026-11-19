@@ -1,6 +1,8 @@
 import type {
   AudioAnalysis,
+  AudioEffectItem,
   AudioSection,
+  AudioSpectralProfile,
   AudioTrackMix,
   BeatMarker,
   ConfidenceLevel,
@@ -11,6 +13,8 @@ export interface RawAudioMeasurements {
   transientTimes: number[];
   hasFadeIn: boolean;
   hasFadeOut: boolean;
+  spectralProfile?: AudioSpectralProfile;
+  dspAudioEffects: AudioEffectItem[];
 }
 
 function buildDefaultTracks(hasAudio: boolean, fadeInSec: number, fadeOutSec: number): AudioTrackMix[] {
@@ -63,6 +67,319 @@ function buildDefaultTracks(hasAudio: boolean, fadeInSec: number, fadeOutSec: nu
   ];
 }
 
+/**
+ * Computes real 4-band spectral energies (Sub-Bass, Bass, Mid, High),
+ * integrated RMS dBFS, peak dBFS, dynamic range, stereo width,
+ * reverb tail decay estimate, low-pass filter cue, and ducking dips.
+ */
+function computeSpectralAndDynamicsProfile(
+  audioBuffer: AudioBuffer,
+  mono: Float32Array,
+  rmsEnv: Float32Array
+): AudioSpectralProfile {
+  const sr = audioBuffer.sampleRate;
+  const len = mono.length;
+  // Subsample stride for very long clips while keeping filter coefficients accurate
+  const maxSamples = Math.min(len, sr * 45);
+
+  const alphaSub = 1 - Math.exp((-2 * Math.PI * 80) / sr);
+  const alphaBass = 1 - Math.exp((-2 * Math.PI * 250) / sr);
+  const alphaMid = 1 - Math.exp((-2 * Math.PI * 3500) / sr);
+
+  let lpSub = 0;
+  let lpBass = 0;
+  let lpMid = 0;
+
+  let eSub = 0;
+  let eBass = 0;
+  let eMid = 0;
+  let eHigh = 0;
+  let sumSq = 0;
+  let peak = 0.00001;
+
+  for (let i = 0; i < maxSamples; i++) {
+    const x = mono[i];
+    const ax = Math.abs(x);
+    if (ax > peak) peak = ax;
+    sumSq += x * x;
+
+    lpSub += alphaSub * (x - lpSub);
+    lpBass += alphaBass * (x - lpBass);
+    lpMid += alphaMid * (x - lpMid);
+
+    const sub = lpSub;
+    const bass = lpBass - lpSub;
+    const mid = lpMid - lpBass;
+    const high = x - lpMid;
+
+    eSub += sub * sub;
+    eBass += bass * bass;
+    eMid += mid * mid;
+    eHigh += high * high;
+  }
+
+  const rmsTotal = Math.sqrt(sumSq / Math.max(1, maxSamples));
+  const integratedRmsDb = Number(Math.max(-60, 20 * Math.log10(Math.max(1e-5, rmsTotal))).toFixed(1));
+  const peakDb = Number(Math.max(-60, 20 * Math.log10(Math.max(1e-5, peak))).toFixed(1));
+  const dynamicRangeDb = Number(Math.max(1, peakDb - integratedRmsDb).toFixed(1));
+
+  const rmsSub = Math.sqrt(eSub / Math.max(1, maxSamples));
+  const rmsBass = Math.sqrt(eBass / Math.max(1, maxSamples));
+  const rmsMid = Math.sqrt(eMid / Math.max(1, maxSamples));
+  const rmsHigh = Math.sqrt(eHigh / Math.max(1, maxSamples));
+  const bandSum = Math.max(1e-5, rmsSub + rmsBass + rmsMid + rmsHigh);
+
+  const subBassEnergy = Math.min(100, Math.round((rmsSub / bandSum) * 210));
+  const bassEnergy = Math.min(100, Math.round((rmsBass / bandSum) * 210));
+  const midEnergy = Math.min(100, Math.round((rmsMid / bandSum) * 210));
+  const highEnergy = Math.min(100, Math.round((rmsHigh / bandSum) * 240));
+
+  // Stereo width via L-R side energy ratio
+  let stereoWidthPercent = 0;
+  if (audioBuffer.numberOfChannels >= 2) {
+    const chL = audioBuffer.getChannelData(0);
+    const chR = audioBuffer.getChannelData(1);
+    let midSum = 0;
+    let sideSum = 0;
+    const step = Math.max(1, Math.floor(maxSamples / 40000));
+    for (let i = 0; i < maxSamples; i += step) {
+      const m = (chL[i] + chR[i]) * 0.5;
+      const s = (chL[i] - chR[i]) * 0.5;
+      midSum += m * m;
+      sideSum += s * s;
+    }
+    const ratio = Math.sqrt(sideSum / Math.max(1e-8, midSum + sideSum));
+    stereoWidthPercent = Math.min(100, Math.round(ratio * 185));
+  }
+
+  // Estimate reverb tail & sustain floor from RMS envelope decay
+  let quietSustainedFrames = 0;
+  let duckingDips = 0;
+  for (let i = 2; i < rmsEnv.length - 2; i++) {
+    if (rmsEnv[i] > 0.14 && rmsEnv[i] < 0.45 && Math.abs(rmsEnv[i] - rmsEnv[i - 1]) < 0.04) {
+      quietSustainedFrames += 1;
+    }
+    if (rmsEnv[i - 2] > 0.55 && rmsEnv[i] < 0.28 && rmsEnv[i + 2] > 0.52) {
+      duckingDips += 1;
+    }
+  }
+  const sustainRatio = quietSustainedFrames / Math.max(1, rmsEnv.length);
+  const reverbTailEstimate: AudioSpectralProfile['reverbTailEstimate'] =
+    sustainRatio > 0.42
+      ? 'Heavy Wash'
+      : sustainRatio > 0.25
+      ? 'Medium Hall'
+      : sustainRatio > 0.12
+      ? 'Subtle Room'
+      : 'Dry';
+
+  const lowPassFilterDetected = highEnergy < 16 && (subBassEnergy + bassEnergy) > 65;
+  const sidechainOrDuckingDetected = duckingDips >= 2;
+
+  return {
+    subBassEnergy,
+    bassEnergy,
+    midEnergy,
+    highEnergy,
+    integratedRmsDb,
+    peakDb,
+    dynamicRangeDb,
+    stereoWidthPercent,
+    reverbTailEstimate,
+    lowPassFilterDetected,
+    sidechainOrDuckingDetected,
+  };
+}
+
+/**
+ * Generates grounded, Free / Built-in Adobe Premiere Pro Audio Effects
+ * directly from real measured Web Audio DSP characteristics.
+ */
+function buildDspFreeAudioEffects(
+  spectral: AudioSpectralProfile,
+  durationSec: number,
+  hasFadeIn: boolean,
+  hasFadeOut: boolean
+): AudioEffectItem[] {
+  const list: AudioEffectItem[] = [];
+  const end = Number(durationSec.toFixed(2));
+
+  // 1. Parametric EQ if bass/sub-bass or mid/high shaping is prominent
+  if (spectral.subBassEnergy >= 32 || spectral.bassEnergy >= 38 || spectral.highEnergy >= 35) {
+    const bassBoostDb = Math.round(((spectral.subBassEnergy + spectral.bassEnergy) / 2 - 30) * 0.12);
+    const highBoostDb = Math.round((spectral.highEnergy - 28) * 0.1);
+    list.push({
+      id: 'afx-dsp-eq',
+      name: 'Parametric Equalizer (Tonal Shaping)',
+      category: 'EQ & Filter',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: end,
+      intensity: Math.min(100, Math.max(25, Math.round((spectral.bassEnergy + spectral.highEnergy) * 0.6))),
+      parameters: {
+        LowShelfGainDb: Math.max(-6, Math.min(8, bassBoostDb)),
+        HighShelfGainDb: Math.max(-6, Math.min(8, highBoostDb)),
+        MidFocusHz: 1800,
+      },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Parametric Equalizer',
+      premiereEffectId: 'ParametricEqualizer',
+      confidence: 'High',
+      notes: `Measured band energy: Sub ${spectral.subBassEnergy}% · Bass ${spectral.bassEnergy}% · Mid ${spectral.midEnergy}% · High ${spectral.highEnergy}%.`,
+    });
+  }
+
+  // 2. Lowpass filter if muffled/underwater frequency balance detected
+  if (spectral.lowPassFilterDetected) {
+    list.push({
+      id: 'afx-dsp-lpf',
+      name: 'Lowpass Filter (Warm / Muffled Roll-Off)',
+      category: 'EQ & Filter',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: Number(Math.min(end, Math.max(1.5, end * 0.35)).toFixed(2)),
+      intensity: 72,
+      parameters: { CutoffHz: 1100 },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Lowpass',
+      premiereEffectId: 'Lowpass',
+      confidence: 'Medium',
+      notes: 'High-frequency roll-off detected relative to bass/sub-bass energy.',
+    });
+  }
+
+  // 3. Single-band Compressor / Hard Limiter when dynamic range is tight (mastered/punched Reel audio)
+  if (spectral.dynamicRangeDb <= 12.5) {
+    list.push({
+      id: 'afx-dsp-comp',
+      name: 'Single-band Compressor (Punch & Loudness)',
+      category: 'Dynamics',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: end,
+      intensity: Math.min(95, Math.max(35, Math.round((15 - spectral.dynamicRangeDb) * 8))),
+      parameters: {
+        ThresholdDb: Number(Math.max(-24, spectral.integratedRmsDb - 2).toFixed(1)),
+        Ratio: spectral.dynamicRangeDb < 8 ? '4.0:1' : '2.5:1',
+        PeakCeilingDb: spectral.peakDb,
+      },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Single-band Compressor',
+      premiereEffectId: 'SingleBandCompressor',
+      confidence: 'High',
+      notes: `Measured RMS ${spectral.integratedRmsDb} dBFS with ${spectral.dynamicRangeDb} dB dynamic range.`,
+    });
+  }
+
+  if (spectral.peakDb >= -2.0) {
+    list.push({
+      id: 'afx-dsp-limiter',
+      name: 'Hard Limiter (Ceiling Protection)',
+      category: 'Dynamics',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: end,
+      intensity: 65,
+      parameters: { MaxAmplitudeDb: -1.0 },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Hard Limiter',
+      premiereEffectId: 'HardLimiter',
+      confidence: 'High',
+      notes: `Peaks reach ${spectral.peakDb} dBFS; Premiere Hard Limiter prevents social loudness clipping.`,
+    });
+  }
+
+  // 4. Studio Reverb when sustained decay tail is detected
+  if (spectral.reverbTailEstimate !== 'Dry') {
+    const wet =
+      spectral.reverbTailEstimate === 'Heavy Wash'
+        ? 55
+        : spectral.reverbTailEstimate === 'Medium Hall'
+        ? 32
+        : 16;
+    list.push({
+      id: 'afx-dsp-reverb',
+      name: `Studio Reverb (${spectral.reverbTailEstimate})`,
+      category: 'Reverb',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: end,
+      intensity: wet,
+      parameters: { WetMixPercent: wet, DecaySec: spectral.reverbTailEstimate === 'Heavy Wash' ? 2.6 : 1.3 },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Studio Reverb',
+      premiereEffectId: 'StudioReverb',
+      confidence: 'Medium',
+      notes: `Sustained ambient energy tail indicates ${spectral.reverbTailEstimate.toLowerCase()} spatial reverb.`,
+    });
+  }
+
+  // 5. Stereo Expander if wide stereo image detected
+  if (spectral.stereoWidthPercent >= 32) {
+    list.push({
+      id: 'afx-dsp-stereo',
+      name: 'Stereo Width Imaging',
+      category: 'Stereo & Pan',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: end,
+      intensity: spectral.stereoWidthPercent,
+      parameters: { WidthPercent: Math.min(180, 100 + Math.round(spectral.stereoWidthPercent * 0.6)) },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Stereo Expander',
+      premiereEffectId: 'StereoExpander',
+      confidence: 'Medium',
+      notes: `Measured L/R stereo side width: ${spectral.stereoWidthPercent}%.`,
+    });
+  }
+
+  // 6. Audio Fade Automation (Constant Power / Exponential Fade)
+  if (hasFadeIn) {
+    list.push({
+      id: 'afx-dsp-fadein',
+      name: 'Audio Fade In (Volume Automation)',
+      category: 'Fade & Automation',
+      trackId: 'A1',
+      startTimeSec: 0,
+      endTimeSec: Math.min(end, 0.75),
+      intensity: 100,
+      parameters: { DurationSec: 0.5 },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Constant Power Fade In',
+      premiereEffectId: 'audiolevels',
+      confidence: 'High',
+      notes: 'Gradual opening volume ramp measured from audio envelope.',
+    });
+  }
+  if (hasFadeOut) {
+    list.push({
+      id: 'afx-dsp-fadeout',
+      name: 'Audio Fade Out (Volume Automation)',
+      category: 'Fade & Automation',
+      trackId: 'A1',
+      startTimeSec: Math.max(0, Number((end - 0.8).toFixed(2))),
+      endTimeSec: end,
+      intensity: 100,
+      parameters: { DurationSec: 0.75 },
+      licenseTier: 'Free / Built-in',
+      includedInTimeline: true,
+      premiereEffectName: 'Exponential Fade Out',
+      premiereEffectId: 'audiolevels',
+      confidence: 'High',
+      notes: 'Closing volume taper measured from audio envelope.',
+    });
+  }
+
+  return list;
+}
+
 export async function analyzeAudioFromFile(
   file: File,
   fallbackDurationSec: number
@@ -87,6 +404,7 @@ export async function analyzeAudioFromFile(
         },
       ],
       sfxEvents: [],
+      audioEffects: [],
       musicDescription: 'No decodable audio track detected in source media.',
       voiceoverDetected: false,
       voiceoverNotes: 'No audio signal available for speech detection.',
@@ -97,9 +415,12 @@ export async function analyzeAudioFromFile(
     transientTimes: [],
     hasFadeIn: false,
     hasFadeOut: false,
+    dspAudioEffects: [],
   });
 
-  const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   if (!AudioCtx) {
     return emptyResult();
   }
@@ -141,7 +462,6 @@ export async function analyzeAudioFromFile(
       if (maxAmp > globalPeak) globalPeak = maxAmp;
     }
 
-    // Check if audio is effectively silent
     if (globalPeak < 0.002) {
       return emptyResult();
     }
@@ -168,14 +488,14 @@ export async function analyzeAudioFromFile(
       rmsEnv[f] /= maxRms;
     }
 
-    // 3. Onset strength function (positive first derivative of smoothed energy)
+    // 3. Onset strength function
     const onset = new Float32Array(numFrames);
     for (let f = 1; f < numFrames; f++) {
       const diff = rmsEnv[f] - rmsEnv[f - 1];
       onset[f] = diff > 0 ? diff : 0;
     }
 
-    // 4. BPM estimation via lag autocorrelation of onset envelope (70..175 BPM)
+    // 4. BPM estimation via lag autocorrelation (70..175 BPM)
     const minLag = Math.round((60 / 175) / hopSec);
     const maxLag = Math.min(numFrames - 2, Math.round((60 / 70) / hopSec));
     let bestLag = Math.round((60 / 120) / hopSec);
@@ -203,7 +523,7 @@ export async function analyzeAudioFromFile(
     const bpmConfidence: ConfidenceLevel =
       corrRatio > 2.2 ? 'High' : corrRatio > 1.35 ? 'Medium' : 'Low';
 
-    // 5. Phase-align beat grid to strongest onset within first beat period
+    // 5. Phase-align beat grid
     const beatPeriodSec = 60 / estimatedBpm;
     const firstBeatFrames = Math.min(numFrames, Math.ceil(beatPeriodSec / hopSec));
     let bestPhaseFrame = 0;
@@ -237,7 +557,7 @@ export async function analyzeAudioFromFile(
       beatNum += 1;
     }
 
-    // 6. Transient candidate detection (for SFX: impacts, hits, whooshes)
+    // 6. Transient candidates
     const transientTimes: number[] = [];
     let meanOnset = 0;
     for (let f = 0; f < numFrames; f++) meanOnset += onset[f];
@@ -246,11 +566,7 @@ export async function analyzeAudioFromFile(
 
     let lastTransientSec = -0.5;
     for (let f = 2; f < numFrames - 2; f++) {
-      if (
-        onset[f] > threshold &&
-        onset[f] >= onset[f - 1] &&
-        onset[f] >= onset[f + 1]
-      ) {
+      if (onset[f] > threshold && onset[f] >= onset[f - 1] && onset[f] >= onset[f + 1]) {
         const t = f * hopSec;
         if (t - lastTransientSec >= 0.35) {
           transientTimes.push(Number(t.toFixed(2)));
@@ -259,7 +575,7 @@ export async function analyzeAudioFromFile(
       }
     }
 
-    // 7. Energy curve (40 buckets) + Musical structure sections
+    // 7. Energy curve & musical sections
     const bucketCount = 40;
     const energyCurve: number[] = [];
     for (let b = 0; b < bucketCount; b++) {
@@ -273,24 +589,9 @@ export async function analyzeAudioFromFile(
     const sections: AudioSection[] = [];
     if (durationSec <= 6) {
       sections.push(
-        {
-          name: 'Intro',
-          startTimeSec: 0,
-          endTimeSec: Number((durationSec * 0.35).toFixed(2)),
-          energyLevel: energyCurve[4] ?? 50,
-        },
-        {
-          name: 'Drop',
-          startTimeSec: Number((durationSec * 0.35).toFixed(2)),
-          endTimeSec: Number((durationSec * 0.85).toFixed(2)),
-          energyLevel: Math.max(...energyCurve.slice(14, 34), 60),
-        },
-        {
-          name: 'Outro',
-          startTimeSec: Number((durationSec * 0.85).toFixed(2)),
-          endTimeSec: Number(durationSec.toFixed(2)),
-          energyLevel: energyCurve[38] ?? 35,
-        }
+        { name: 'Intro', startTimeSec: 0, endTimeSec: Number((durationSec * 0.35).toFixed(2)), energyLevel: energyCurve[4] ?? 50 },
+        { name: 'Drop', startTimeSec: Number((durationSec * 0.35).toFixed(2)), endTimeSec: Number((durationSec * 0.85).toFixed(2)), energyLevel: Math.max(...energyCurve.slice(14, 34), 60) },
+        { name: 'Outro', startTimeSec: Number((durationSec * 0.85).toFixed(2)), endTimeSec: Number(durationSec.toFixed(2)), energyLevel: energyCurve[38] ?? 35 }
       );
     } else {
       const q1 = Number((durationSec * 0.18).toFixed(2));
@@ -308,7 +609,7 @@ export async function analyzeAudioFromFile(
       );
     }
 
-    // 8. Fade in / Fade out detection
+    // 8. Fade in / Fade out
     const startAvg = (energyCurve[0] + energyCurve[1]) / 2;
     const midAvg = energyCurve.slice(8, 30).reduce((a, b) => a + b, 0) / 22;
     const endAvg = (energyCurve[38] + energyCurve[39]) / 2;
@@ -316,6 +617,15 @@ export async function analyzeAudioFromFile(
     const hasFadeOut = endAvg < midAvg * 0.45 && durationSec > 2;
     const fadeInSec = hasFadeIn ? 0.5 : 0;
     const fadeOutSec = hasFadeOut ? 0.75 : 0;
+
+    // 9. Real Spectral & Dynamics DSP Profile + Built-in Free Audio Effects
+    const spectralProfile = computeSpectralAndDynamicsProfile(audioBuffer, mono, rmsEnv);
+    const dspAudioEffects = buildDspFreeAudioEffects(
+      spectralProfile,
+      durationSec,
+      hasFadeIn,
+      hasFadeOut
+    );
 
     return {
       analysis: {
@@ -330,16 +640,20 @@ export async function analyzeAudioFromFile(
         beats,
         sections,
         sfxEvents: [],
-        musicDescription: `Measured ${estimatedBpm} BPM audio track (${channels}ch · ${(sampleRate / 1000).toFixed(1)} kHz).`,
+        audioEffects: dspAudioEffects,
+        spectralProfile,
+        musicDescription: `Measured ${estimatedBpm} BPM audio (${channels}ch · ${(sampleRate / 1000).toFixed(1)} kHz · RMS ${spectralProfile.integratedRmsDb} dBFS · ${spectralProfile.reverbTailEstimate} reverb).`,
         voiceoverDetected: false,
-        voiceoverNotes: 'Pending AI multimodal audio-visual correlation.',
+        voiceoverNotes: 'Pending AI audio-visual correlation.',
         sourceSeparationNote:
-          'Browser-side Web Audio DSP extracted full-mix waveform, beat grid, and transient peaks. Exact vocal/stem separation is not run locally; original mixed audio is preserved on A1 with reconstructed cue tracks on A2–A4.',
+          'Web Audio DSP analyzed 4-band spectrum, loudness dynamics, stereo width, reverb decay, beat grid, and transient peaks. All free Premiere Pro built-in audio effects are mapped directly to track filters.',
         tracks: buildDefaultTracks(true, fadeInSec, fadeOutSec),
       },
       transientTimes: transientTimes.slice(0, 18),
       hasFadeIn,
       hasFadeOut,
+      spectralProfile,
+      dspAudioEffects,
     };
   } catch {
     return emptyResult();

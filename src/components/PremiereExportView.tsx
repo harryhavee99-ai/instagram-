@@ -11,6 +11,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { AppSettings, ReelProject } from '../types/project';
+import { generateSrtSubtitles } from '../engine/captionPresets';
 import {
   buildPremiereZipBlob,
   generateCubeLut,
@@ -254,6 +255,25 @@ export const PremiereExportView: React.FC<PremiereExportViewProps> = ({
                 <Download className="w-3.5 h-3.5 text-[#A5ACBF]" />
                 <span>Relinking Guide</span>
               </button>
+              <button
+                type="button"
+                disabled={project.motionGraphics.length === 0}
+                onClick={() =>
+                  triggerFileDownload(
+                    generateSrtSubtitles(project.motionGraphics),
+                    `${project.name}_Captions.srt`,
+                    'application/x-subrip'
+                  )
+                }
+                className="col-span-2 px-3 py-2 rounded-lg bg-[#0C0D11] hover:bg-[#1A1D26] disabled:opacity-45 disabled:pointer-events-none border border-white/[0.1] text-[12px] text-white inline-flex items-center justify-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5 text-[#FACC15]" />
+                <span>
+                  {project.motionGraphics.length > 0
+                    ? `Captions (.srt · ${project.motionGraphics.length} cues)`
+                    : 'Captions (.srt · none detected)'}
+                </span>
+              </button>
             </div>
           </div>
         </div>
@@ -274,6 +294,45 @@ export const PremiereExportView: React.FC<PremiereExportViewProps> = ({
               <div className="text-[11px] text-[#7F869B]">Native Coverage</div>
               <div className="text-[22px] font-mono tabular-nums font-semibold text-[#4ADE80]">
                 {project.compatibility.nativeCoveragePercent}%
+              </div>
+            </div>
+          </div>
+
+          {/* Embedded Free FX vs Skipped Paid Summary */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-[12px]">
+            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+              <div className="text-[#7F869B]">Free Video FX</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#4ADE80] mt-0.5">
+                {
+                  project.effects.filter(
+                    (e) => e.includedInTimeline !== false && e.licenseTier !== 'Paid / Third-Party'
+                  ).length
+                }
+              </div>
+            </div>
+            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+              <div className="text-[#7F869B]">Free Audio FX</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#38BDF8] mt-0.5">
+                {
+                  (project.audio.audioEffects ?? []).filter(
+                    (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
+                  ).length
+                }
+              </div>
+            </div>
+            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+              <div className="text-[#7F869B]">Paid FX Skipped</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#FBBF24] mt-0.5">
+                {project.effects.filter((e) => e.licenseTier === 'Paid / Third-Party').length +
+                  (project.audio.audioEffects ?? []).filter(
+                    (e) => e.licenseTier === 'Paid / Third-Party'
+                  ).length}
+              </div>
+            </div>
+            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+              <div className="text-[#7F869B]">Captions &amp; Titles</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#9B82FF] mt-0.5">
+                {project.motionGraphics.length}
               </div>
             </div>
           </div>
@@ -306,7 +365,7 @@ export const PremiereExportView: React.FC<PremiereExportViewProps> = ({
             <div className="p-3.5 rounded-lg bg-[#0C0D11] border border-white/[0.08] space-y-1.5">
               <div className="font-medium text-[#F87171] flex items-center gap-1.5">
                 <XCircle className="w-3.5 h-3.5" />
-                <span>Unsupported / Missing Assets</span>
+                <span>Skipped Paid Plugins & Missing Assets</span>
               </div>
               <ul className="space-y-1 text-[#C6CBD9]">
                 {[

@@ -3,6 +3,7 @@ import { Film } from 'lucide-react';
 import type {
   AnalysisPipelineStage,
   AppSettings,
+  AudioEffectItem,
   AudioTrackMix,
   ColorGradeSettings,
   EffectItem,
@@ -308,23 +309,32 @@ export default function App() {
       const end = clamp(start + 2.0, start + 0.4, prev.metadata.durationSec);
       const newItem: MotionGraphicItem = {
         id: `gfx-${Date.now()}`,
-        text: 'NEW TITLE OVERLAY',
-        type: 'Title',
+        text: 'WATCH THIS EDIT',
+        type: 'Caption',
+        isCaption: true,
         trackId: 'V3',
         startTimeSec: Number(start.toFixed(2)),
         endTimeSec: Number(end.toFixed(2)),
         fontFamily: 'Outfit',
-        fontSize: 44,
-        fontWeight: 700,
+        fontSize: 48,
+        fontWeight: 900,
         positionXPercent: 50,
-        positionYPercent: 78,
+        positionYPercent: 76,
         colorHex: '#FFFFFF',
         outlineColorHex: '#000000',
+        outlineWidthPx: 4,
+        backgroundColorHex: '#000000',
+        backgroundOpacity: 0,
+        highlightColorHex: '#FACC15',
+        highlightWord: 'WATCH',
+        textTransform: 'uppercase',
+        captionStylePreset: 'Bold Hormozi',
         hasShadow: true,
-        animationType: 'Slide Up',
-        animationDurationSec: 0.35,
+        animationType: 'Bounce Pop',
+        animationDurationSec: 0.25,
         confidence: 'High',
-        fontSubstituteNote: 'User-created editable SVG plate.',
+        spellChecked: true,
+        fontSubstituteNote: 'User-created styled & animated caption plate + .srt cue.',
       };
       setSelectedGraphicId(newItem.id);
       return {
@@ -351,6 +361,21 @@ export default function App() {
         audio: {
           ...prev.audio,
           tracks,
+        },
+      }));
+    },
+    [commitProjectEdit]
+  );
+
+  const handleUpdateAudioEffect = useCallback(
+    (effectId: string, patch: Partial<AudioEffectItem>) => {
+      commitProjectEdit((prev) => ({
+        ...prev,
+        audio: {
+          ...prev.audio,
+          audioEffects: (prev.audio.audioEffects ?? []).map((ef) =>
+            ef.id === effectId ? { ...ef, ...patch } : ef
+          ),
         },
       }));
     },
@@ -591,6 +616,7 @@ export default function App() {
             currentTimeSec={currentTimeSec}
             onSeek={setCurrentTimeSec}
             onUpdateTracks={handleUpdateTracks}
+            onUpdateAudioEffect={handleUpdateAudioEffect}
           />
         ) : (
           renderRequiresProjectPrompt()

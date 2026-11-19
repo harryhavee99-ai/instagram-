@@ -144,9 +144,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                   <p className="text-[#A5ACBF] leading-relaxed">{instagramResult.accessNotice}</p>
                   {instagramResult.valid && instagramResult.metadata && (
-                    <div className="text-[12px] font-mono tabular-nums text-[#8E96AC] pt-0.5">
-                      {instagramResult.metadata.authorName} · {instagramResult.metadata.aspectRatio} ·{' '}
-                      {instagramResult.normalizedUrl}
+                    <div className="space-y-1 pt-0.5">
+                      <div className="text-[12px] font-mono tabular-nums text-[#8E96AC]">
+                        {instagramResult.metadata.authorName} · {instagramResult.metadata.aspectRatio} ·{' '}
+                        {instagramResult.normalizedUrl}
+                      </div>
+                      {(instagramResult.metadata.caption || instagramResult.metadata.title) && (
+                        <div className="text-[12px] text-[#C6CBD9] line-clamp-2">
+                          {instagramResult.metadata.caption || instagramResult.metadata.title}
+                        </div>
+                      )}
+                      {instagramResult.metadata.hashtags &&
+                        instagramResult.metadata.hashtags.length > 0 && (
+                          <div className="text-[11px] font-mono text-[#9B82FF] truncate">
+                            {instagramResult.metadata.hashtags.join('  ')}
+                          </div>
+                        )}
                     </div>
                   )}
                 </div>

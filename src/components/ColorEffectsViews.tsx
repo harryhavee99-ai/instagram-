@@ -1,11 +1,27 @@
-import React from 'react';
-import { Download, Plus, RotateCcw, Trash2 } from 'lucide-react';
+import React, { useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Download,
+  Loader2,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  Trash2,
+} from 'lucide-react';
 import type {
+  CaptionStylePreset,
   ColorGradeSettings,
   EffectItem,
   MotionGraphicItem,
   ReelProject,
 } from '../types/project';
+import {
+  CAPTION_ANIMATION_OPTIONS,
+  CAPTION_PRESET_NAMES,
+  CAPTION_STYLE_PRESETS,
+  generateSrtSubtitles,
+} from '../engine/captionPresets';
 import { buildColorFilterCss, formatTimecodeMs } from '../engine/formatters';
 import { generateCubeLut, triggerFileDownload } from '../engine/premiereXmlGenerator';
 
@@ -281,6 +297,66 @@ export const EffectsAnalysisView: React.FC<EffectsAnalysisViewProps> = ({
   onAddGraphic,
   onDeleteGraphic,
 }) => {
+  const [proofreading, setProofreading] = useState(false);
+  const [proofreadNotice, setProofreadNotice] = useState<string | null>(null);
+
+  const handleProofreadAllCaptions = async () => {
+    if (project.motionGraphics.length === 0 || proofreading) return;
+    setProofreading(true);
+    setProofreadNotice(null);
+    try {
+      const res = await fetch('/api/captions/proofread', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          captions: project.motionGraphics.map((g) => ({
+            id: g.id,
+            text: g.text,
+            highlightWord: g.highlightWord || '',
+            startTimeSec: g.startTimeSec,
+            endTimeSec: g.endTimeSec,
+          })),
+          contextNote: project.name,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error('Spellcheck service returned an error');
+      }
+      const data = await res.json();
+      const correctedList = Array.isArray(data?.corrected) ? data.corrected : [];
+      let fixedCount = 0;
+
+      correctedList.forEach(
+        (item: { id?: string; text?: string; highlightWord?: string; fixedSpelling?: boolean }) => {
+          if (!item?.id || typeof item.text !== 'string') return;
+          const clean = item.text.replace(/\s+/g, ' ').trim();
+          if (!clean) return;
+          if (item.fixedSpelling) fixedCount++;
+          onUpdateGraphic(item.id, {
+            text: clean,
+            highlightWord:
+              typeof item.highlightWord === 'string' && item.highlightWord.trim().length > 0
+                ? item.highlightWord.trim()
+                : undefined,
+            spellChecked: true,
+          });
+        }
+      );
+
+      setProofreadNotice(
+        fixedCount > 0
+          ? `Verified ${project.motionGraphics.length} captions — corrected ${fixedCount} spelling/OCR issue${fixedCount === 1 ? '' : 's'}.`
+          : `All ${project.motionGraphics.length} captions verified with zero spelling mistakes.`
+      );
+    } catch (err) {
+      setProofreadNotice(
+        err instanceof Error ? err.message : 'Unable to complete spellcheck right now.'
+      );
+    } finally {
+      setProofreading(false);
+    }
+  };
+
   return (
     <div className="max-w-[1160px] mx-auto px-8 py-8 space-y-8">
       <div className="space-y-1">
@@ -355,167 +431,387 @@ export const EffectsAnalysisView: React.FC<EffectsAnalysisViewProps> = ({
         </div>
       </section>
 
-      {/* Visual Effects Section */}
-      <section className="rounded-xl bg-[#13151B] border border-white/[0.08] p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-[15px] font-semibold text-white">Detected Visual Effects</h2>
-          <span className="text-[12px] font-mono tabular-nums text-[#8E96AC]">
-            {project.effects.length} items
-          </span>
-        </div>
+      {/* Visual Effects Section: Free / Built-in Included vs Paid Plugins Skipped */}
+      {(() => {
+        const freeVideoFx = project.effects.filter((ef) => ef.licenseTier !== 'Paid / Third-Party');
+        const paidVideoFx = project.effects.filter((ef) => ef.licenseTier === 'Paid / Third-Party');
 
-        {project.effects.length === 0 ? (
-          <p className="text-[13px] text-[#7F869B]">
-            No standalone stylize, blur, glitch, or light-leak effects were detected beyond standard
-            motion and color grading.
-          </p>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {project.effects.map((ef) => (
-              <div
-                key={ef.id}
-                className="p-4 rounded-lg bg-[#0C0D11] border border-white/[0.08] space-y-3"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="text-[14px] font-semibold text-white">{ef.name}</div>
-                    <div className="text-[12px] text-[#8E96AC] font-mono tabular-nums">
-                      {formatTimecodeMs(ef.startTimeSec)} – {formatTimecodeMs(ef.endTimeSec)} ·{' '}
-                      {ef.category} · {ef.confidence}
-                    </div>
-                  </div>
-                  <span
-                    className={`text-[12px] font-medium shrink-0 ${
-                      ef.premiereSupport === 'Native'
-                        ? 'text-[#4ADE80]'
-                        : ef.premiereSupport === 'Approximate'
-                        ? 'text-[#FBBF24]'
-                        : 'text-[#F87171]'
+        return (
+          <section className="rounded-xl bg-[#13151B] border border-white/[0.08] p-6 space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-[15px] font-semibold text-white">
+                  Detected Visual Effects (Free Built-in Added · Paid Plugins Skipped)
+                </h2>
+                <p className="text-[12px] text-[#8E96AC]">
+                  Every Free / Built-in Adobe Premiere Pro effect is bound to the reconstructed
+                  timeline & XMEML. Paid third-party plugins are bypassed automatically without
+                  halting processing.
+                </p>
+              </div>
+              <span className="text-[12px] font-mono tabular-nums text-[#4ADE80]">
+                {freeVideoFx.filter((e) => e.includedInTimeline !== false).length} Free FX Added
+                {paidVideoFx.length > 0 ? ` · ${paidVideoFx.length} Paid Skipped` : ''}
+              </span>
+            </div>
+
+            {freeVideoFx.length === 0 ? (
+              <p className="text-[13px] text-[#7F869B]">
+                No standalone built-in stylize, blur, glitch, or light effects were detected beyond
+                standard motion and color grading.
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {freeVideoFx.map((ef) => (
+                  <div
+                    key={ef.id}
+                    className={`p-4 rounded-lg border space-y-3 transition-colors ${
+                      ef.includedInTimeline !== false
+                        ? 'bg-[#0C0D11] border-white/[0.08]'
+                        : 'bg-[#0C0D11]/50 border-white/[0.04] opacity-60'
                     }`}
                   >
-                    {ef.premiereSupport}
-                  </span>
-                </div>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[14px] font-semibold text-white truncate">
+                          {ef.name}
+                        </div>
+                        <div className="text-[12px] text-[#8E96AC] font-mono tabular-nums">
+                          {formatTimecodeMs(ef.startTimeSec)} – {formatTimecodeMs(ef.endTimeSec)} ·{' '}
+                          {ef.category} · Free / Built-in · {ef.confidence}
+                        </div>
+                      </div>
+                      <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[#4ADE80] shrink-0 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={ef.includedInTimeline !== false}
+                          onChange={(e) =>
+                            onUpdateEffect(ef.id, { includedInTimeline: e.target.checked })
+                          }
+                          className="w-3.5 h-3.5 accent-[#7C5CFF]"
+                        />
+                        <span>{ef.includedInTimeline !== false ? 'In XMEML' : 'Off'}</span>
+                      </label>
+                    </div>
 
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[12px]">
-                    <span className="text-[#8E96AC]">Reconstructed Intensity</span>
-                    <span className="font-mono tabular-nums text-white">{ef.intensity}%</span>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[12px]">
+                        <span className="text-[#8E96AC]">Reconstructed Intensity</span>
+                        <span className="font-mono tabular-nums text-white">{ef.intensity}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        value={ef.intensity}
+                        onChange={(e) => onUpdateEffect(ef.id, { intensity: Number(e.target.value) })}
+                        className="w-full"
+                      />
+                    </div>
+
+                    <div className="text-[12px] text-[#A5ACBF] leading-relaxed">
+                      <span className="text-white font-medium">{ef.premiereEffectName}:</span>{' '}
+                      {ef.approximationNote}
+                    </div>
                   </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={100}
-                    value={ef.intensity}
-                    onChange={(e) => onUpdateEffect(ef.id, { intensity: Number(e.target.value) })}
-                    className="w-full"
-                  />
-                </div>
+                ))}
+              </div>
+            )}
 
-                <div className="text-[12px] text-[#A5ACBF] leading-relaxed">
-                  <span className="text-white font-medium">{ef.premiereEffectName}:</span>{' '}
-                  {ef.approximationNote}
+            {paidVideoFx.length > 0 && (
+              <div className="pt-4 border-t border-white/[0.08] space-y-3">
+                <div className="flex items-center gap-2 text-[13px] font-medium text-[#FBBF24]">
+                  <AlertTriangle className="w-4 h-4 shrink-0" />
+                  <span>Skipped Paid / Third-Party Video Effects ({paidVideoFx.length})</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {paidVideoFx.map((ef) => (
+                    <div
+                      key={ef.id}
+                      className="p-3.5 rounded-lg bg-[#19150E] border border-[#D97706]/35 space-y-1.5 text-[12px]"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-white">{ef.name}</span>
+                        <span className="font-mono text-[#FBBF24] shrink-0">Paid · Skipped</span>
+                      </div>
+                      <div className="text-[#8E96AC] font-mono tabular-nums">
+                        {formatTimecodeMs(ef.startTimeSec)} – {formatTimecodeMs(ef.endTimeSec)} ·{' '}
+                        Vendor: {ef.pluginVendor || 'Third-Party'}
+                      </div>
+                      <p className="text-[#D4D8E3] leading-relaxed">
+                        {ef.skippedReason || ef.approximationNote}
+                      </p>
+                    </div>
+                  ))}
                 </div>
               </div>
-            ))}
-          </div>
-        )}
-      </section>
+            )}
+          </section>
+        );
+      })()}
 
-      {/* Motion Graphics & OCR Text Reconstruction */}
+      {/* Captions, Styling, Animations & OCR Motion Graphics */}
       <section className="rounded-xl bg-[#13151B] border border-white/[0.08] p-6 space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-1">
             <h2 className="text-[15px] font-semibold text-white">
-              OCR Motion Graphics & Editable Text Layers (Track V3)
+              Captions, Styles &amp; Animated Text Layers (Track V3 + Premiere .srt)
             </h2>
             <p className="text-[12px] text-[#8E96AC]">
-              Only text visually confirmed in sampled frames is extracted automatically. Edit copy,
-              color, or timing below—exported as vector SVG plates inside the Premiere package.
+              Captions detected in video frames are automatically spell-checked and reconstructed
+              with matching styles, keyword highlights, and animations—exported as animated Track V3
+              SVG plates plus a Premiere-ready .srt caption file.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onAddGraphic}
-            className="px-3.5 py-2 rounded-lg bg-[#1A1D26] hover:bg-[#232736] border border-white/[0.1] text-[12px] font-medium text-white inline-flex items-center gap-1.5 whitespace-nowrap"
-          >
-            <Plus className="w-3.5 h-3.5 text-[#9B82FF]" />
-            <span>Add Title Layer</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={project.motionGraphics.length === 0 || proofreading}
+              onClick={handleProofreadAllCaptions}
+              className="px-3 py-2 rounded-lg bg-[#1A1D26] hover:bg-[#232736] disabled:opacity-45 disabled:pointer-events-none border border-[#7C5CFF]/40 text-[12px] font-medium text-white inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              {proofreading ? (
+                <Loader2 className="w-3.5 h-3.5 text-[#9B82FF] animate-spin" />
+              ) : (
+                <Sparkles className="w-3.5 h-3.5 text-[#9B82FF]" />
+              )}
+              <span>{proofreading ? 'Verifying Spelling...' : 'AI Spellcheck All'}</span>
+            </button>
+            <button
+              type="button"
+              disabled={project.motionGraphics.length === 0}
+              onClick={() =>
+                triggerFileDownload(
+                  generateSrtSubtitles(project.motionGraphics),
+                  `${project.name}_Captions.srt`,
+                  'application/x-subrip'
+                )
+              }
+              className="px-3 py-2 rounded-lg bg-[#1A1D26] hover:bg-[#232736] disabled:opacity-45 disabled:pointer-events-none border border-white/[0.1] text-[12px] font-medium text-white inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5 text-[#FACC15]" />
+              <span>Download .srt</span>
+            </button>
+            <button
+              type="button"
+              onClick={onAddGraphic}
+              className="px-3.5 py-2 rounded-lg bg-[#7C5CFF] hover:bg-[#6D4DF2] text-[12px] font-medium text-white inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Caption / Title</span>
+            </button>
+          </div>
         </div>
+
+        {proofreadNotice && (
+          <div className="px-3.5 py-2.5 rounded-lg bg-[#0C0D11] border border-[#4ADE80]/30 text-[12px] text-[#D4D8E3] flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-[#4ADE80] shrink-0" />
+            <span>{proofreadNotice}</span>
+          </div>
+        )}
 
         {project.motionGraphics.length === 0 ? (
           <div className="p-6 rounded-lg bg-[#0C0D11] border border-white/[0.06] text-[13px] text-[#7F869B]">
-            No visible on-screen text or titles were detected in this video. Click "Add Title Layer"
-            if you want to place a custom graphic plate on Track V3.
+            No visible on-screen captions or titles were detected in this video. Click &quot;Add
+            Caption / Title&quot; to place a styled, animated caption layer on Track V3 and export
+            it to Premiere Pro.
           </div>
         ) : (
           <div className="space-y-3">
-            {project.motionGraphics.map((g) => (
+            {project.motionGraphics.map((g, idx) => (
               <div
                 key={g.id}
-                className="p-4 rounded-lg bg-[#0C0D11] border border-white/[0.08] grid grid-cols-1 md:grid-cols-12 gap-3 items-center"
+                className="p-4 rounded-lg bg-[#0C0D11] border border-white/[0.08] space-y-3"
               >
-                <div className="md:col-span-4 space-y-1">
-                  <label className="text-[11px] text-[#7F869B]">Text Content ({g.type})</label>
-                  <input
-                    type="text"
-                    value={g.text}
-                    onChange={(e) => onUpdateGraphic(g.id, { text: e.target.value })}
-                    className="w-full h-9 px-3 rounded-md bg-[#13151B] border border-white/[0.12] text-[13px] text-white"
-                  />
-                </div>
-                <div className="md:col-span-2 space-y-1">
-                  <label className="text-[11px] text-[#7F869B]">Animation</label>
-                  <select
-                    value={g.animationType}
-                    onChange={(e) =>
-                      onUpdateGraphic(g.id, {
-                        animationType: e.target.value as MotionGraphicItem['animationType'],
-                      })
-                    }
-                    className="w-full h-9 px-2.5 rounded-md bg-[#13151B] border border-white/[0.12] text-[12px] text-white"
-                  >
-                    <option value="None">Static</option>
-                    <option value="Fade">Fade</option>
-                    <option value="Pop In">Pop In</option>
-                    <option value="Slide Up">Slide Up</option>
-                    <option value="Kinetic Scale">Kinetic Scale</option>
-                  </select>
-                </div>
-                <div className="md:col-span-2 space-y-1">
-                  <label className="text-[11px] text-[#7F869B]">Size (px)</label>
-                  <input
-                    type="number"
-                    min={16}
-                    max={120}
-                    value={g.fontSize}
-                    onChange={(e) => onUpdateGraphic(g.id, { fontSize: Number(e.target.value) })}
-                    className="w-full h-9 px-2.5 rounded-md bg-[#13151B] border border-white/[0.12] text-[12px] font-mono text-white"
-                  />
-                </div>
-                <div className="md:col-span-2 space-y-1">
-                  <label className="text-[11px] text-[#7F869B]">In – Out (s)</label>
-                  <div className="text-[12px] font-mono tabular-nums text-[#D4D8E3] h-9 flex items-center">
-                    {g.startTimeSec.toFixed(1)}s – {g.endTimeSec.toFixed(1)}s
+                {/* Row 1: Caption copy, Preset, Animation, Timing & Delete */}
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                  <div className="md:col-span-5 space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-[#7F869B]">
+                        #{idx + 1} · {g.isCaption ? 'Caption' : g.type}
+                      </span>
+                      {g.spellChecked && (
+                        <span className="text-[#4ADE80] inline-flex items-center gap-1">
+                          <CheckCircle2 className="w-3 h-3" />
+                          <span>Spellcheck Verified</span>
+                        </span>
+                      )}
+                    </div>
+                    <input
+                      type="text"
+                      value={g.text}
+                      onChange={(e) => onUpdateGraphic(g.id, { text: e.target.value })}
+                      className="w-full h-9 px-3 rounded-md bg-[#13151B] border border-white/[0.12] text-[13px] text-white"
+                    />
+                  </div>
+
+                  <div className="md:col-span-3 space-y-1">
+                    <label className="text-[11px] text-[#7F869B]">Caption Style Preset</label>
+                    <select
+                      value={g.captionStylePreset || 'Bold Hormozi'}
+                      onChange={(e) => {
+                        const preset = e.target.value as CaptionStylePreset;
+                        onUpdateGraphic(g.id, CAPTION_STYLE_PRESETS[preset].patch);
+                      }}
+                      className="w-full h-9 px-2.5 rounded-md bg-[#13151B] border border-white/[0.12] text-[12px] text-white"
+                    >
+                      {CAPTION_PRESET_NAMES.map((presetName) => (
+                        <option key={presetName} value={presetName}>
+                          {presetName}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="md:col-span-2 space-y-1">
+                    <label className="text-[11px] text-[#7F869B]">Animation</label>
+                    <select
+                      value={g.animationType}
+                      onChange={(e) =>
+                        onUpdateGraphic(g.id, {
+                          animationType: e.target.value as MotionGraphicItem['animationType'],
+                        })
+                      }
+                      className="w-full h-9 px-2.5 rounded-md bg-[#13151B] border border-white/[0.12] text-[12px] text-white"
+                    >
+                      {CAPTION_ANIMATION_OPTIONS.map((anim) => (
+                        <option key={anim} value={anim}>
+                          {anim === 'None' ? 'Static' : anim}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="md:col-span-2 flex items-center justify-between gap-2 h-9">
+                    <span className="text-[12px] font-mono tabular-nums text-[#D4D8E3]">
+                      {g.startTimeSec.toFixed(1)}s – {g.endTimeSec.toFixed(1)}s
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onDeleteGraphic(g.id)}
+                      title="Delete caption layer"
+                      className="p-2 rounded-md text-[#8E96AC] hover:text-[#F87171] hover:bg-white/[0.06]"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
-                <div className="md:col-span-2 flex items-center justify-end gap-2 pt-4 md:pt-0">
-                  <input
-                    type="color"
-                    aria-label="Text color"
-                    value={g.colorHex}
-                    onChange={(e) => onUpdateGraphic(g.id, { colorHex: e.target.value })}
-                    className="w-8 h-8 rounded bg-transparent border border-white/[0.15] cursor-pointer"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => onDeleteGraphic(g.id)}
-                    title="Delete graphic layer"
-                    className="p-2 rounded-md text-[#8E96AC] hover:text-[#F87171] hover:bg-white/[0.06]"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+
+                {/* Row 2: Fine caption styling controls */}
+                <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 pt-2 border-t border-white/[0.06] items-end text-[11px]">
+                  <div className="space-y-1">
+                    <label className="text-[#7F869B]">Highlight Word</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. WATCH"
+                      value={g.highlightWord || ''}
+                      onChange={(e) =>
+                        onUpdateGraphic(g.id, { highlightWord: e.target.value || undefined })
+                      }
+                      className="w-full h-8 px-2 rounded bg-[#13151B] border border-white/[0.1] text-[12px] text-white"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[#7F869B]">Text Case</label>
+                    <select
+                      value={g.textTransform || 'none'}
+                      onChange={(e) =>
+                        onUpdateGraphic(g.id, {
+                          textTransform: e.target.value as MotionGraphicItem['textTransform'],
+                        })
+                      }
+                      className="w-full h-8 px-2 rounded bg-[#13151B] border border-white/[0.1] text-[12px] text-white"
+                    >
+                      <option value="uppercase">UPPERCASE</option>
+                      <option value="capitalize">Capitalize</option>
+                      <option value="none">Normal</option>
+                    </select>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[#7F869B]">Size (px)</label>
+                    <input
+                      type="number"
+                      min={16}
+                      max={120}
+                      value={g.fontSize}
+                      onChange={(e) => onUpdateGraphic(g.id, { fontSize: Number(e.target.value) })}
+                      className="w-full h-8 px-2 rounded bg-[#13151B] border border-white/[0.1] text-[12px] font-mono text-white"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[#7F869B]">
+                      <span>Outline</span>
+                      <span className="font-mono text-[#D4D8E3]">{g.outlineWidthPx ?? 2}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={10}
+                      value={g.outlineWidthPx ?? 2}
+                      onChange={(e) =>
+                        onUpdateGraphic(g.id, { outlineWidthPx: Number(e.target.value) })
+                      }
+                      className="w-full h-8"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[#7F869B]">
+                      <span>Box Opacity</span>
+                      <span className="font-mono text-[#D4D8E3]">{g.backgroundOpacity ?? 0}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={g.backgroundOpacity ?? 0}
+                      onChange={(e) =>
+                        onUpdateGraphic(g.id, { backgroundOpacity: Number(e.target.value) })
+                      }
+                      className="w-full h-8"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 h-8">
+                    <div className="flex flex-col items-center">
+                      <span className="text-[10px] text-[#7F869B]">Text</span>
+                      <input
+                        type="color"
+                        aria-label="Primary text color"
+                        value={g.colorHex}
+                        onChange={(e) => onUpdateGraphic(g.id, { colorHex: e.target.value })}
+                        className="w-6 h-6 rounded bg-transparent border border-white/[0.15] cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <span className="text-[10px] text-[#7F869B]">Pop</span>
+                      <input
+                        type="color"
+                        aria-label="Highlight color"
+                        value={g.highlightColorHex || '#FACC15'}
+                        onChange={(e) =>
+                          onUpdateGraphic(g.id, { highlightColorHex: e.target.value })
+                        }
+                        className="w-6 h-6 rounded bg-transparent border border-white/[0.15] cursor-pointer"
+                      />
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <span className="text-[10px] text-[#7F869B]">Box</span>
+                      <input
+                        type="color"
+                        aria-label="Background box color"
+                        value={g.backgroundColorHex || '#000000'}
+                        onChange={(e) =>
+                          onUpdateGraphic(g.id, { backgroundColorHex: e.target.value })
+                        }
+                        className="w-6 h-6 rounded bg-transparent border border-white/[0.15] cursor-pointer"
+                      />
+                    </div>
+                  </div>
                 </div>
               </div>
             ))}
