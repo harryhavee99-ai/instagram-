@@ -16,7 +16,9 @@ interface ImportInstagramViewProps {
   onInstagramUrlChange: (url: string) => void;
   result: InstagramInspectResult | null;
   inspecting: boolean;
-  onInspect: (url: string) => Promise<void>;
+  isAnalyzing?: boolean;
+  onInspect: (url: string, autoBuild?: boolean) => Promise<void>;
+  onAnalyzeLink: () => void;
   onUploadAuthorizedFile: (file: File) => void;
 }
 
@@ -25,7 +27,9 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
   onInstagramUrlChange,
   result,
   inspecting,
+  isAnalyzing = false,
   onInspect,
+  onAnalyzeLink,
   onUploadAuthorizedFile,
 }) => {
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -46,12 +50,12 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          onInspect(instagramUrl);
+          onInspect(instagramUrl, true);
         }}
         className="rounded-xl bg-[#13151B] border border-white/[0.08] p-6 space-y-4"
       >
         <label className="block text-[13px] font-medium text-[#D4D8E3]">
-          Instagram Reel or Post URL
+          Instagram Reel, Post, or Direct Video URL
         </label>
         <div className="flex flex-col sm:flex-row gap-3">
           <div className="relative flex-1">
@@ -60,17 +64,25 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
               type="text"
               value={instagramUrl}
               onChange={(e) => onInstagramUrlChange(e.target.value)}
-              placeholder="https://www.instagram.com/reel/C9Example123/"
+              placeholder="https://www.instagram.com/reel/C9Example123/ or direct .mp4 URL"
               className="w-full h-11 pl-10 pr-4 rounded-lg bg-[#0B0C10] border border-white/[0.12] text-[14px] text-white placeholder:text-[#5E6578] focus:outline-none focus:border-[#7C5CFF]"
             />
           </div>
           <button
             type="submit"
-            disabled={inspecting || !instagramUrl.trim()}
+            disabled={inspecting || isAnalyzing || !instagramUrl.trim()}
             className="h-11 px-5 rounded-lg bg-[#7C5CFF] hover:bg-[#6D4BF0] disabled:opacity-45 text-white text-[13px] font-medium inline-flex items-center justify-center gap-2 whitespace-nowrap"
           >
-            {inspecting && <Loader2 className="w-4 h-4 animate-spin" />}
-            <span>Validate & Inspect URL</span>
+            {(inspecting || isAnalyzing) && <Loader2 className="w-4 h-4 animate-spin" />}
+            <span>Analyze &amp; Build Premiere Project</span>
+          </button>
+          <button
+            type="button"
+            disabled={inspecting || isAnalyzing || !instagramUrl.trim()}
+            onClick={() => onInspect(instagramUrl, false)}
+            className="h-11 px-4 rounded-lg bg-[#1A1D26] hover:bg-[#232736] disabled:opacity-45 border border-white/[0.1] text-[#D4D8E3] text-[13px] font-medium whitespace-nowrap"
+          >
+            Inspect Only
           </button>
         </div>
 
@@ -80,6 +92,8 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
           <span>instagram.com/p/…</span>
           <span aria-hidden="true">·</span>
           <span>instagram.com/tv/…</span>
+          <span aria-hidden="true">·</span>
+          <span>Direct .mp4 / .webm URLs</span>
         </div>
       </form>
 
@@ -108,11 +122,11 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
 
           {result.valid && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-5 pt-2 border-t border-white/[0.08]">
-              {/* Preview Thumbnail if returned by Meta oEmbed */}
+              {/* Preview Thumbnail if returned by Meta oEmbed or OpenGraph */}
               <div className="rounded-lg bg-[#0B0C10] border border-white/[0.08] overflow-hidden flex items-center justify-center min-h-[180px]">
-                {result.metadata?.thumbnailUrl ? (
+                {result.metadata?.thumbnailDataUrl || result.metadata?.thumbnailUrl ? (
                   <img
-                    src={result.metadata.thumbnailUrl}
+                    src={result.metadata.thumbnailDataUrl || result.metadata.thumbnailUrl}
                     alt={result.metadata.title || 'Instagram media thumbnail'}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
@@ -121,9 +135,7 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
                   <div className="p-4 text-center space-y-1.5">
                     <Instagram className="w-6 h-6 text-[#555C70] mx-auto" />
                     <div className="text-[12px] text-[#8E96AC]">
-                      {result.oEmbedConfigured
-                        ? 'Preview thumbnail unavailable'
-                        : 'Configure META_OEMBED_TOKEN for live oEmbed thumbnail'}
+                      Ready for direct link AI reconstruction
                     </div>
                   </div>
                 )}
@@ -186,10 +198,11 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
                   </div>
                 )}
                 <div className="col-span-2">
-                  <div className="text-[11px] text-[#7F869B]">Direct Video Stream Access</div>
-                  <div className="text-[#FDE68A] mt-0.5">
-                    Not provided by Instagram oEmbed — upload your authorized video file to begin
-                    frame-level analysis
+                  <div className="text-[11px] text-[#7F869B]">Premiere Pro Reconstruction Mode</div>
+                  <div className="text-[#4ADE80] mt-0.5">
+                    {result.directVideoAvailable
+                      ? 'Direct video stream available — full pixel-by-pixel & Web Audio reconstruction'
+                      : 'Direct Link AI Reconstruction ready (Separated Clips + Caption Layers + Sound Design WAV Layers)'}
                   </div>
                 </div>
               </div>
@@ -198,18 +211,29 @@ export const ImportInstagramView: React.FC<ImportInstagramViewProps> = ({
 
           {result.valid && (
             <div className="pt-3 border-t border-white/[0.08] flex flex-wrap items-center justify-between gap-4">
-              <div className="text-[12px] text-[#8E96AC]">
-                Attach the original video file associated with this link to start the 11-stage
-                reverse-engineering pipeline.
+              <div className="text-[12px] text-[#8E96AC] max-w-md">
+                Build your downloadable Adobe Premiere Pro project directly from this link—or attach
+                your local MP4 file for frame-by-frame pixel extraction.
               </div>
-              <button
-                type="button"
-                onClick={() => fileRef.current?.click()}
-                className="px-4 py-2 rounded-lg bg-[#7C5CFF] hover:bg-[#6D4BF0] text-white text-[13px] font-medium inline-flex items-center gap-2 whitespace-nowrap"
-              >
-                <Upload className="w-4 h-4" />
-                <span>Upload Authorized Source Video</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={isAnalyzing}
+                  onClick={onAnalyzeLink}
+                  className="px-4 py-2 rounded-lg bg-[#7C5CFF] hover:bg-[#6D4BF0] disabled:opacity-45 text-white text-[13px] font-medium inline-flex items-center gap-2 whitespace-nowrap"
+                >
+                  {isAnalyzing && <Loader2 className="w-4 h-4 animate-spin" />}
+                  <span>Analyze Link &amp; Build Premiere Project</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  className="px-3.5 py-2 rounded-lg bg-[#1A1D26] hover:bg-[#232736] border border-white/[0.12] text-white text-[13px] font-medium inline-flex items-center gap-2 whitespace-nowrap"
+                >
+                  <Upload className="w-4 h-4 text-[#9B82FF]" />
+                  <span>Attach Local Video (Optional)</span>
+                </button>
+              </div>
               <input
                 ref={fileRef}
                 type="file"

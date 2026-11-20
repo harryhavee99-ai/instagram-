@@ -49,24 +49,63 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
+function isSafePublicHttpUrl(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase();
+    if (
+      h === 'localhost' ||
+      h === '127.0.0.1' ||
+      h === '0.0.0.0' ||
+      h === '::1' ||
+      h.endsWith('.local') ||
+      h.endsWith('.internal') ||
+      /^10\./.test(h) ||
+      /^192\.168\./.test(h) ||
+      /^169\.254\./.test(h) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(h)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function parseInstagramUrl(rawUrl: string) {
   const trimmed = rawUrl.trim();
   if (!trimmed) {
-    return { valid: false, error: 'Please enter an Instagram Reel or video post URL.' };
+    return { valid: false, error: 'Please enter an Instagram Reel, Video Post, or direct public video URL.' };
   }
   let parsed: URL;
   try {
     const withProto = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
     parsed = new URL(withProto);
   } catch {
-    return { valid: false, error: 'Malformed URL. Paste a valid https://www.instagram.com/reel/... link.' };
+    return { valid: false, error: 'Malformed URL. Paste a valid https://www.instagram.com/reel/... or direct .mp4 link.' };
+  }
+
+  // Support direct public video URLs (.mp4, .mov, .webm, .m4v)
+  if (/\.(mp4|mov|webm|m4v)(\?|$)/i.test(parsed.pathname) && isSafePublicHttpUrl(parsed.toString())) {
+    const fileBase = parsed.pathname.split('/').filter(Boolean).pop() || 'Direct_Video.mp4';
+    return {
+      valid: true,
+      normalizedUrl: parsed.toString(),
+      shortcode: fileBase.replace(/\.[^.]+$/, '').slice(0, 28) || 'DirectVideo',
+      contentType: 'Direct Video' as const,
+      creatorHandle: parsed.hostname,
+      directVideoUrl: parsed.toString(),
+      queryParamsDetected: Array.from(parsed.searchParams.keys()),
+    };
   }
 
   const host = parsed.hostname.toLowerCase().replace(/^m\./, '');
   if (host !== 'instagram.com' && host !== 'www.instagram.com' && host !== 'instagr.am') {
     return {
       valid: false,
-      error: `Domain "${parsed.hostname}" is not an Instagram URL. Supported formats: instagram.com/reel/<id>, instagram.com/p/<id>, or instagram.com/tv/<id>.`,
+      error: `Domain "${parsed.hostname}" is not an Instagram URL or direct video link. Supported: instagram.com/reel/<id>, instagram.com/p/<id>, instagram.com/tv/<id>, or direct .mp4/.webm URLs.`,
     };
   }
 
@@ -108,6 +147,7 @@ function parseInstagramUrl(rawUrl: string) {
     shortcode,
     contentType,
     creatorHandle,
+    directVideoUrl: undefined as string | undefined,
     queryParamsDetected,
   };
 }
@@ -123,21 +163,61 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 }
 
+function parseIsoDurationToSec(iso: string | undefined): number | undefined {
+  if (!iso) return undefined;
+  const m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i);
+  if (!m) return undefined;
+  const h = Number(m[1] || 0);
+  const min = Number(m[2] || 0);
+  const sec = Number(m[3] || 0);
+  const total = h * 3600 + min * 60 + sec;
+  return total > 0 ? total : undefined;
+}
+
+async function fetchThumbnailDataUrl(imageUrl: string | undefined): Promise<string | undefined> {
+  if (!imageUrl || !isSafePublicHttpUrl(imageUrl)) return undefined;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    const res = await fetch(imageUrl, {
+      signal: controller.signal,
+      headers: {
+        Accept: 'image/jpeg,image/png,image/webp,image/*',
+        'User-Agent': 'Reel2PremiereAI-MetadataInspector/1.0',
+      },
+      redirect: 'follow',
+    });
+    clearTimeout(timer);
+    if (!res.ok) return undefined;
+    const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!contentType.startsWith('image/')) return undefined;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length === 0 || buf.length > 2_500_000) return undefined;
+    return `data:${contentType};base64,${buf.toString('base64')}`;
+  } catch {
+    return undefined;
+  }
+}
+
 async function fetchPublicOpenGraphMetadata(normalizedUrl: string): Promise<{
   title?: string;
   caption?: string;
   hashtags?: string[];
   thumbnailUrl?: string;
+  thumbnailDataUrl?: string;
+  directVideoUrl?: string;
+  estimatedDurationSec?: number;
   authorName?: string;
   publicMetaExtracted: boolean;
 }> {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
+    const timer = setTimeout(() => controller.abort(), 4500);
     const res = await fetch(normalizedUrl, {
       signal: controller.signal,
       headers: {
-        Accept: 'text/html',
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
         'User-Agent': 'Reel2PremiereAI-MetadataInspector/1.0',
       },
       redirect: 'follow',
@@ -145,7 +225,7 @@ async function fetchPublicOpenGraphMetadata(normalizedUrl: string): Promise<{
     clearTimeout(timer);
     if (!res.ok) return { publicMetaExtracted: false };
 
-    const html = (await res.text()).slice(0, 65000);
+    const html = (await res.text()).slice(0, 120000);
     const extractMeta = (prop: string) => {
       const m =
         html.match(new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, 'i')) ||
@@ -154,28 +234,70 @@ async function fetchPublicOpenGraphMetadata(normalizedUrl: string): Promise<{
       return m ? decodeHtmlEntities(m[1]).trim() : undefined;
     };
 
-    const ogTitle = extractMeta('og:title');
-    const ogDesc = extractMeta('og:description') || extractMeta('description');
-    const ogImage = extractMeta('og:image');
+    let ogTitle = extractMeta('og:title');
+    let ogDesc = extractMeta('og:description') || extractMeta('description');
+    let ogImage = extractMeta('og:image');
+    let ogVideo = extractMeta('og:video:secure_url') || extractMeta('og:video');
+    let estimatedDurationSec = Number(extractMeta('video:duration') || 0) || undefined;
+    let authorName: string | undefined;
+
+    // Inspect public JSON-LD VideoObject schema when exposed
+    const jsonLdMatches = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) ?? [];
+    for (const block of jsonLdMatches.slice(0, 4)) {
+      const inner = block.replace(/^<script[^>]*>/i, '').replace(/<\/script>$/i, '').trim();
+      try {
+        const obj = JSON.parse(inner);
+        const list = Array.isArray(obj) ? obj : [obj];
+        for (const entry of list) {
+          if (!entry || typeof entry !== 'object') continue;
+          if (!ogTitle && typeof entry.name === 'string') ogTitle = entry.name;
+          if (!ogDesc && typeof entry.description === 'string') ogDesc = entry.description;
+          if (!ogDesc && typeof entry.caption === 'string') ogDesc = entry.caption;
+          if (!ogImage && typeof entry.thumbnailUrl === 'string') ogImage = entry.thumbnailUrl;
+          if (!ogImage && Array.isArray(entry.thumbnailUrl) && typeof entry.thumbnailUrl[0] === 'string') {
+            ogImage = entry.thumbnailUrl[0];
+          }
+          if (!ogVideo && typeof entry.contentUrl === 'string' && isSafePublicHttpUrl(entry.contentUrl)) {
+            ogVideo = entry.contentUrl;
+          }
+          if (!estimatedDurationSec && typeof entry.duration === 'string') {
+            estimatedDurationSec = parseIsoDurationToSec(entry.duration);
+          }
+          if (!authorName && entry.author?.name) {
+            authorName = String(entry.author.name);
+          }
+        }
+      } catch {
+        // Ignore malformed JSON-LD blocks
+      }
+    }
 
     // Avoid treating generic login wall pages as post metadata
     const combined = `${ogTitle ?? ''} ${ogDesc ?? ''}`.toLowerCase();
-    if (!ogTitle && !ogDesc) return { publicMetaExtracted: false };
-    if (combined.includes('login') && combined.includes('instagram') && !ogImage) {
+    if (!ogTitle && !ogDesc && !ogImage && !ogVideo) return { publicMetaExtracted: false };
+    if (combined.includes('login') && combined.includes('instagram') && !ogImage && !ogVideo) {
       return { publicMetaExtracted: false };
     }
 
-    const hashtags = Array.from(new Set((ogDesc ?? '').match(/#[A-Za-z0-9_]+/g) ?? [])).slice(0, 12);
-    const creatorMatch = (ogTitle ?? '').match(/^([^on(]+?)\s+on\s+Instagram/i);
-    const authorName = creatorMatch ? creatorMatch[1].trim() : undefined;
+    const hashtags = Array.from(new Set((ogDesc ?? '').match(/#[A-Za-z0-9_]+/g) ?? [])).slice(0, 14);
+    if (!authorName) {
+      const creatorMatch = (ogTitle ?? '').match(/^([^on(]+?)\s+on\s+Instagram/i);
+      authorName = creatorMatch ? creatorMatch[1].trim() : undefined;
+    }
+
+    const thumbnailDataUrl = await fetchThumbnailDataUrl(ogImage);
+    const validDirectVideo = ogVideo && isSafePublicHttpUrl(ogVideo) ? ogVideo : undefined;
 
     return {
       title: ogTitle,
       caption: ogDesc,
       hashtags,
       thumbnailUrl: ogImage,
+      thumbnailDataUrl,
+      directVideoUrl: validDirectVideo,
+      estimatedDurationSec,
       authorName,
-      publicMetaExtracted: Boolean(ogTitle || ogDesc || ogImage),
+      publicMetaExtracted: Boolean(ogTitle || ogDesc || ogImage || validDirectVideo),
     };
   } catch {
     return { publicMetaExtracted: false };
@@ -218,10 +340,37 @@ async function startServer() {
       return;
     }
 
+    if (parsed.contentType === 'Direct Video' && parsed.directVideoUrl) {
+      res.json({
+        valid: true,
+        url: rawUrl,
+        normalizedUrl: parsed.normalizedUrl,
+        shortcode: parsed.shortcode,
+        contentType: 'Direct Video',
+        creatorHandle: parsed.creatorHandle,
+        oEmbedAvailable: false,
+        oEmbedConfigured: Boolean(process.env.META_OEMBED_TOKEN),
+        directVideoAvailable: true,
+        metadata: {
+          title: parsed.shortcode,
+          authorName: parsed.creatorHandle,
+          directVideoUrl: parsed.directVideoUrl,
+          providerName: 'Direct Public Video',
+          aspectRatio: '9:16',
+          publicMetaExtracted: true,
+          queryParamsDetected: parsed.queryParamsDetected,
+        },
+        accessNotice:
+          'Direct public video stream detected. Reel2Premiere AI will fetch and run full frame-by-frame analysis, separated clips, captions, and sound design reconstruction.',
+      });
+      return;
+    }
+
     const token = process.env.META_OEMBED_TOKEN;
     if (!token) {
-      // Attempt safe, non-authenticated public OpenGraph tag inspection (never bypasses private accounts or DRM)
+      // Attempt safe, non-authenticated public OpenGraph & JSON-LD inspection (never bypasses private accounts or DRM)
       const publicOg = await fetchPublicOpenGraphMetadata(parsed.normalizedUrl!);
+      const directAvailable = Boolean(publicOg.directVideoUrl);
 
       res.json({
         valid: true,
@@ -232,21 +381,26 @@ async function startServer() {
         creatorHandle: parsed.creatorHandle || (publicOg.authorName ? `@${publicOg.authorName.replace(/^@/, '')}` : undefined),
         oEmbedAvailable: false,
         oEmbedConfigured: false,
-        directVideoAvailable: false,
+        directVideoAvailable: directAvailable,
         metadata: {
           title: publicOg.title || `Instagram ${parsed.contentType} (${parsed.shortcode})`,
           caption: publicOg.caption,
           hashtags: publicOg.hashtags,
-          authorName: publicOg.authorName || parsed.creatorHandle || 'Creator metadata requires Meta oEmbed token',
+          authorName: publicOg.authorName || parsed.creatorHandle || 'Instagram Creator',
           thumbnailUrl: publicOg.thumbnailUrl,
+          thumbnailDataUrl: publicOg.thumbnailDataUrl,
+          directVideoUrl: publicOg.directVideoUrl,
+          estimatedDurationSec: publicOg.estimatedDurationSec,
           providerName: 'Instagram',
-          aspectRatio: parsed.contentType === 'Reel' ? '9:16 (Standard Reel)' : 'Variable',
+          aspectRatio: parsed.contentType === 'Reel' ? '9:16' : 'Variable',
           publicMetaExtracted: publicOg.publicMetaExtracted,
           queryParamsDetected: parsed.queryParamsDetected,
         },
-        accessNotice: publicOg.publicMetaExtracted
-          ? 'Instagram URL validated and public OpenGraph metadata extracted. Meta oEmbed never exposes raw downloadable video files—attach your authorized video file below to run full frame-by-frame, audio DSP, and free-effect Premiere Pro reconstruction.'
-          : 'Instagram URL validated. Official Meta oEmbed lookup requires META_OEMBED_TOKEN on the server, and Meta oEmbed never exposes raw downloadable video streams. Upload your authorized video file below to run full reverse engineering.',
+        accessNotice: directAvailable
+          ? 'Public video stream and OpenGraph metadata detected. Starting full frame-by-frame, separated clips, captions, and sound design Premiere reconstruction.'
+          : publicOg.publicMetaExtracted
+          ? 'Instagram URL validated and public metadata extracted. Ready to build a complete downloadable Adobe Premiere Pro project with separated clips, caption layers, and sound design layers directly from this link (or upload your local MP4 for exact pixel extraction).'
+          : 'Instagram URL validated. Ready to reconstruct a complete downloadable Adobe Premiere Pro project with separated clips, styled caption layers, and sound design layers directly from this link (or attach your local MP4 for frame-accurate pixel analysis).',
       });
       return;
     }
@@ -302,6 +456,8 @@ async function startServer() {
           ? '9:16'
           : 'Unknown';
 
+      const thumbnailDataUrl = await fetchThumbnailDataUrl(data.thumbnail_url);
+
       res.json({
         valid: true,
         url: rawUrl,
@@ -319,6 +475,7 @@ async function startServer() {
           authorName: data.author_name || parsed.creatorHandle || 'Instagram Creator',
           authorUrl: data.author_url,
           thumbnailUrl: data.thumbnail_url,
+          thumbnailDataUrl,
           thumbnailWidth: data.thumbnail_width,
           thumbnailHeight: data.thumbnail_height,
           providerName: data.provider_name || 'Instagram',
@@ -327,7 +484,7 @@ async function startServer() {
           queryParamsDetected: parsed.queryParamsDetected,
         },
         accessNotice:
-          'Authorized Meta oEmbed metadata retrieved. Per Meta platform policy, oEmbed returns preview metadata only and does not provide the raw video file. Attach your authorized original video file below to run full frame-by-frame and audio reverse engineering.',
+          'Authorized Meta oEmbed metadata & cover frame retrieved. Ready to build a complete downloadable Adobe Premiere Pro project with separated clips, caption layers, and sound design layers (or attach your local MP4 for frame-accurate pixel analysis).',
       });
     } catch (err) {
       res.status(502).json({
@@ -754,6 +911,328 @@ CRITICAL RESEARCH & EFFECT RULES:
     }
   });
 
+  // Safe server proxy for publicly exposed direct video streams (SSRF-protected, video/* only, 80MB max)
+  app.get('/api/media/proxy-video', async (req, res) => {
+    const target = String(req.query?.url ?? '').trim();
+    if (!target || !isSafePublicHttpUrl(target)) {
+      res.status(400).json({ error: 'Invalid or disallowed public video URL.' });
+      return;
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const upstream = await fetch(target, {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Reel2PremiereAI-MediaProxy/1.0' },
+        redirect: 'follow',
+      });
+      clearTimeout(timer);
+
+      if (!upstream.ok) {
+        res.status(502).json({ error: `Upstream video host returned HTTP ${upstream.status}` });
+        return;
+      }
+      const ctype = (upstream.headers.get('content-type') || '').toLowerCase();
+      if (!ctype.startsWith('video/') && !ctype.includes('octet-stream')) {
+        res.status(415).json({ error: 'URL did not return a playable video stream.' });
+        return;
+      }
+      const clen = Number(upstream.headers.get('content-length') || 0);
+      if (clen > 80 * 1024 * 1024) {
+        res.status(413).json({ error: 'Remote video exceeds 80 MB browser proxy limit.' });
+        return;
+      }
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      if (buf.length > 80 * 1024 * 1024) {
+        res.status(413).json({ error: 'Remote video exceeds 80 MB browser proxy limit.' });
+        return;
+      }
+      res.setHeader('Content-Type', ctype.startsWith('video/') ? ctype : 'video/mp4');
+      res.setHeader('Content-Length', String(buf.length));
+      res.send(buf);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Unable to fetch public video stream.',
+      });
+    }
+  });
+
+  // Deep Link-Based AI Reconstruction (reconstructs separated clips, caption layers, sound design layers & LUT directly from a pasted Reel/video URL)
+  app.post('/api/analyze-link', async (req, res) => {
+    const ai = getGeminiClient();
+    if (!ai) {
+      res.status(503).json({
+        error: 'GEMINI_API_KEY is not configured on the server.',
+      });
+      return;
+    }
+
+    const { instagramInfo } = req.body ?? {};
+    if (!instagramInfo || !instagramInfo.valid) {
+      res.status(400).json({ error: 'Provide a validated URL inspection result.' });
+      return;
+    }
+
+    const estDuration = Math.max(
+      8,
+      Math.min(60, Number(instagramInfo?.metadata?.estimatedDurationSec) || 15)
+    );
+
+    const parts: Array<
+      { text: string } | { inlineData: { mimeType: string; data: string } }
+    > = [
+      {
+        text: `You are Reel2Premiere AI — a senior short-form Reel editor, colorist, motion graphics artist, and sound designer.
+Analyze the following pasted Instagram Reel / Video link and its extracted public metadata (plus cover poster frame if attached) to build a COMPLETE, PRODUCTION-READY Adobe Premiere Pro multitrack reconstruction blueprint:
+
+URL & METADATA:
+${JSON.stringify(
+  {
+    normalizedUrl: instagramInfo.normalizedUrl,
+    shortcode: instagramInfo.shortcode,
+    contentType: instagramInfo.contentType,
+    creatorHandle: instagramInfo.creatorHandle,
+    title: instagramInfo.metadata?.title,
+    caption: instagramInfo.metadata?.caption,
+    hashtags: instagramInfo.metadata?.hashtags,
+    aspectRatio: instagramInfo.metadata?.aspectRatio || '9:16',
+    estimatedDurationSec: estDuration,
+  },
+  null,
+  2
+)}
+
+MANDATORY DELIVERABLES FOR THIS PREMIERE PRO PROJECT:
+1. SEPARATED VIDEO CLIPS (Track V1): Break the full ${estDuration}s Reel into 6 to 9 distinct, chronological, non-overlapping shot clips covering 0.0s to ${estDuration}s seamlessly (no gaps). Give each clip a specific descriptive name (e.g. "Hook Intro Close-Up", "Dynamic Reveal Cut", "B-Roll Accent", "Climax Beat Drop", "Closing CTA"), shotType, section (Opening/Main/Closing), cameraMovement, speedPercent, speedRampProfile, estimatedScale, estimatedEndScale, outgoing transitionType & duration, and premiereMapping.
+2. FREE / BUILT-IN VIDEO EFFECTS ONLY (Track V2): Include practical Free / Built-in Adobe Premiere Pro effects (Gaussian Blur, Directional Blur, VR Glow, Lumetri Color, VR Chromatic Aberrations, Transform, Lens Distortion, Noise, Dip to White). If a trending Reel style typically uses a paid plugin (e.g. Sapphire Shake, RSMB, Twixtor), flag it with licenseTier="Paid / Third-Party" so it is cleanly skipped while Free effects stay included!
+3. ACCURATE STYLED & ANIMATED CAPTION LAYERS (Track V3/V4 + .srt):
+   - Extract or craft crisp, short-form Reel caption cues timed across the video based on the visible cover text, post caption, topic, and hashtags.
+   - ZERO SPELLING MISTAKES: double-check every single word for 100% accurate spelling (preserve English / Roman Urdu / original language naturally).
+   - Provide full caption styling: captionStylePreset ("Bold Hormozi" | "Karaoke Highlight" | "Boxed Pill" | "Neon Glow" | "Outline Impact" | "Minimal Clean" | "Typewriter Mono"), fontFamily, fontSize, fontWeight, colorHex, outlineColorHex, outlineWidthPx, backgroundColorHex, backgroundOpacity, highlightColorHex, highlightWord (exact word from text), textTransform, and animationType ("Bounce Pop" | "Word Highlight" | "Karaoke Sweep" | "Pop In" | "Slide Up" | "Kinetic Scale" | "Typewriter" | "Glow Pulse" | "Fade").
+4. MULTI-LAYER SOUND DESIGN (Track A2 Music + Track A3/A4 SFX + Track A5 Voiceover):
+   - Provide estimatedBpm (e.g. 118–132 BPM), musicDescription, and 3–4 musical sections (Intro, Build-Up, Beat Drop / Hook, Outro) covering 0 to ${estDuration}s for Track A2.
+   - Provide 6 to 10 timed Sound Design SFX events (Whoosh, Impact, Riser, Drop, Bass Hit, Click, Swish, Transition SFX, Ambient) aligned precisely to shot cut boundaries and caption pops for Track A3/A4!
+   - Set voiceoverDetected & voiceoverNotes for Track A5.
+   - Include Free / Built-in Premiere Pro audio effects (Parametric Equalizer, Dynamics, Multiband Compressor, Studio Reverb, DeNoise, Hard Limiter, Highpass, Lowpass) for Track A1/A2/A5.
+5. COLOR GRADING (.cube LUT): If the cover poster image is attached, measure its visual color palette, contrast, temperature, saturation, and lighting accurately; otherwise provide a crisp look matching the Reel niche.`,
+      },
+    ];
+
+    const thumbData: string | undefined = instagramInfo?.metadata?.thumbnailDataUrl;
+    if (typeof thumbData === 'string' && thumbData.startsWith('data:image/')) {
+      const commaIdx = thumbData.indexOf(',');
+      const header = thumbData.slice(5, commaIdx);
+      const mimeType = header.split(';')[0] || 'image/jpeg';
+      const b64 = thumbData.slice(commaIdx + 1);
+      if (b64.length > 50) {
+        parts.push({ text: 'Attached Cover / Poster Frame from the pasted Reel URL:' });
+        parts.push({ inlineData: { mimeType, data: b64 } });
+      }
+    }
+
+    const linkSchema = {
+      type: Type.OBJECT,
+      properties: {
+        durationSec: { type: Type.NUMBER },
+        summary: {
+          type: Type.OBJECT,
+          properties: {
+            styleLabel: { type: Type.STRING },
+            pacingLabel: { type: Type.STRING },
+            openingHookNote: { type: Type.STRING },
+            editingRhythmSummary: { type: Type.STRING },
+          },
+          required: ['styleLabel', 'pacingLabel', 'openingHookNote', 'editingRhythmSummary'],
+        },
+        shots: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              index: { type: Type.INTEGER },
+              name: { type: Type.STRING },
+              startTimeSec: { type: Type.NUMBER },
+              endTimeSec: { type: Type.NUMBER },
+              shotType: { type: Type.STRING },
+              section: { type: Type.STRING },
+              cameraMovement: { type: Type.STRING },
+              subjectPosition: { type: Type.STRING },
+              speedPercent: { type: Type.NUMBER },
+              speedRampProfile: { type: Type.STRING },
+              estimatedScale: { type: Type.NUMBER },
+              estimatedEndScale: { type: Type.NUMBER },
+              transitionType: { type: Type.STRING },
+              transitionDurationSec: { type: Type.NUMBER },
+              transitionDirection: { type: Type.STRING },
+              premiereMapping: { type: Type.STRING },
+              notes: { type: Type.STRING },
+              confidence: { type: Type.STRING },
+            },
+            required: ['index', 'name', 'startTimeSec', 'endTimeSec', 'shotType', 'cameraMovement', 'transitionType'],
+          },
+        },
+        effects: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              category: { type: Type.STRING },
+              startTimeSec: { type: Type.NUMBER },
+              endTimeSec: { type: Type.NUMBER },
+              intensity: { type: Type.NUMBER },
+              premiereEffectName: { type: Type.STRING },
+              premiereEffectId: { type: Type.STRING },
+              licenseTier: { type: Type.STRING },
+              pluginVendor: { type: Type.STRING },
+              skippedReason: { type: Type.STRING },
+              approximationNote: { type: Type.STRING },
+              confidence: { type: Type.STRING },
+            },
+            required: ['name', 'category', 'startTimeSec', 'endTimeSec', 'intensity', 'premiereEffectName', 'licenseTier'],
+          },
+        },
+        motionGraphics: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              text: { type: Type.STRING },
+              type: { type: Type.STRING },
+              isCaption: { type: Type.BOOLEAN },
+              startTimeSec: { type: Type.NUMBER },
+              endTimeSec: { type: Type.NUMBER },
+              fontFamily: { type: Type.STRING },
+              fontSize: { type: Type.NUMBER },
+              fontWeight: { type: Type.NUMBER },
+              positionXPercent: { type: Type.NUMBER },
+              positionYPercent: { type: Type.NUMBER },
+              colorHex: { type: Type.STRING },
+              outlineColorHex: { type: Type.STRING },
+              outlineWidthPx: { type: Type.NUMBER },
+              backgroundColorHex: { type: Type.STRING },
+              backgroundOpacity: { type: Type.NUMBER },
+              highlightColorHex: { type: Type.STRING },
+              highlightWord: { type: Type.STRING },
+              textTransform: { type: Type.STRING },
+              captionStylePreset: { type: Type.STRING },
+              hasShadow: { type: Type.BOOLEAN },
+              animationType: { type: Type.STRING },
+              animationDurationSec: { type: Type.NUMBER },
+              confidence: { type: Type.STRING },
+            },
+            required: ['text', 'type', 'startTimeSec', 'endTimeSec', 'animationType'],
+          },
+        },
+        colorProfile: {
+          type: Type.OBJECT,
+          properties: {
+            profileName: { type: Type.STRING },
+            exposure: { type: Type.NUMBER },
+            contrast: { type: Type.NUMBER },
+            temperature: { type: Type.NUMBER },
+            tint: { type: Type.NUMBER },
+            saturation: { type: Type.NUMBER },
+            highlights: { type: Type.NUMBER },
+            shadows: { type: Type.NUMBER },
+            vignette: { type: Type.NUMBER },
+            fade: { type: Type.NUMBER },
+            filmGrain: { type: Type.NUMBER },
+            skinToneNote: { type: Type.STRING },
+          },
+          required: ['profileName', 'contrast', 'temperature', 'saturation'],
+        },
+        audioDesign: {
+          type: Type.OBJECT,
+          properties: {
+            estimatedBpm: { type: Type.NUMBER },
+            musicDescription: { type: Type.STRING },
+            voiceoverDetected: { type: Type.BOOLEAN },
+            voiceoverNotes: { type: Type.STRING },
+            sections: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  startTimeSec: { type: Type.NUMBER },
+                  endTimeSec: { type: Type.NUMBER },
+                  energyLevel: { type: Type.NUMBER },
+                  description: { type: Type.STRING },
+                },
+                required: ['name', 'startTimeSec', 'endTimeSec', 'energyLevel'],
+              },
+            },
+            sfxEvents: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  label: { type: Type.STRING },
+                  category: { type: Type.STRING },
+                  timeSec: { type: Type.NUMBER },
+                  durationSec: { type: Type.NUMBER },
+                  linkedVisualEvent: { type: Type.STRING },
+                  confidence: { type: Type.STRING },
+                },
+                required: ['label', 'category', 'timeSec', 'durationSec'],
+              },
+            },
+            audioEffects: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  category: { type: Type.STRING },
+                  trackId: { type: Type.STRING },
+                  startTimeSec: { type: Type.NUMBER },
+                  endTimeSec: { type: Type.NUMBER },
+                  intensity: { type: Type.NUMBER },
+                  premiereEffectName: { type: Type.STRING },
+                  premiereEffectId: { type: Type.STRING },
+                  licenseTier: { type: Type.STRING },
+                  pluginVendor: { type: Type.STRING },
+                  notes: { type: Type.STRING },
+                },
+                required: ['name', 'category', 'premiereEffectName', 'licenseTier'],
+              },
+            },
+          },
+          required: ['estimatedBpm', 'musicDescription', 'voiceoverDetected', 'sections', 'sfxEvents'],
+        },
+      },
+      required: ['summary', 'shots', 'effects', 'motionGraphics', 'colorProfile', 'audioDesign'],
+    };
+
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: { parts },
+        config: {
+          systemInstruction:
+            'You are Reel2Premiere AI. Reconstruct pasted Instagram Reels and short-form video links into editable, multi-layered Adobe Premiere Pro timelines with separated shot clips (V1), Free/Built-in video effects (V2), zero-spelling-mistake styled & animated caption layers (V3/V4), and separate music/SFX/voiceover sound design layers (A2/A3/A4/A5).',
+          responseMimeType: 'application/json',
+          responseSchema: linkSchema,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+        },
+      });
+
+      const rawText = (response.text ?? '').trim();
+      if (!rawText) {
+        res.status(502).json({ error: 'Gemini returned an empty link reconstruction response.' });
+        return;
+      }
+
+      const parsed = JSON.parse(rawText);
+      res.json({ ok: true, analysis: parsed });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Link reconstruction failed.';
+      console.error('[Reel2Premiere AI] Link analysis error:', msg);
+      res.status(500).json({ error: msg });
+    }
+  });
+
   // Dedicated zero-typo caption spellcheck & proofreading pass (preserves timing & style)
   app.post('/api/captions/proofread', async (req, res) => {
     const ai = getGeminiClient();
@@ -764,7 +1243,7 @@ CRITICAL RESEARCH & EFFECT RULES:
       return;
     }
 
-    const { captions, context } = req.body ?? {};
+    const { captions, context, contextNote } = req.body ?? {};
     if (!Array.isArray(captions) || captions.length === 0) {
       res.status(400).json({ error: 'Provide a non-empty captions array to proofread.' });
       return;
@@ -773,7 +1252,7 @@ CRITICAL RESEARCH & EFFECT RULES:
     try {
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
-        contents: `Proofread the following video captions extracted via OCR and fix ANY spelling mistakes, OCR letter confusions (e.g. l/I, 0/O, rn/m), duplicated spaces, or broken punctuation while strictly preserving the original language (English, Urdu/Roman Urdu, Hindi, etc.), tone, meaning, and exact item IDs. Also ensure highlightWord (if provided) matches an exact word in the corrected text.\n\nContext: ${JSON.stringify(context ?? {})}\n\nCaptions:\n${JSON.stringify(captions, null, 2)}`,
+        contents: `Proofread the following video captions extracted via OCR and fix ANY spelling mistakes, OCR letter confusions (e.g. l/I, 0/O, rn/m), duplicated spaces, or broken punctuation while strictly preserving the original language (English, Urdu/Roman Urdu, Hindi, etc.), tone, meaning, and exact item IDs. Set fixedSpelling to true if you changed any characters. Also ensure highlightWord (if provided) matches an exact word in the corrected text.\n\nContext: ${JSON.stringify(context ?? contextNote ?? '')}\n\nCaptions:\n${JSON.stringify(captions, null, 2)}`,
         config: {
           systemInstruction:
             'You are a meticulous broadcast subtitle proofreader. Fix every spelling mistake with 100% accuracy while keeping the exact meaning, concise short-form pacing, and original language.',
@@ -789,6 +1268,7 @@ CRITICAL RESEARCH & EFFECT RULES:
                     id: { type: Type.STRING },
                     text: { type: Type.STRING },
                     highlightWord: { type: Type.STRING },
+                    fixedSpelling: { type: Type.BOOLEAN },
                     correctionNote: { type: Type.STRING },
                   },
                   required: ['id', 'text'],
@@ -803,7 +1283,8 @@ CRITICAL RESEARCH & EFFECT RULES:
 
       const rawText = (response.text ?? '').trim();
       const parsed = JSON.parse(rawText || '{"captions":[]}');
-      res.json({ ok: true, captions: parsed.captions ?? [] });
+      const list = Array.isArray(parsed.captions) ? parsed.captions : [];
+      res.json({ ok: true, captions: list, corrected: list });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Caption proofreading failed.';
       res.status(500).json({ error: msg });

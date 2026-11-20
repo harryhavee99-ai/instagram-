@@ -18,6 +18,7 @@ import {
   generatePremiereXmeml,
   generateReconstructionReportMarkdown,
   generateRelinkingGuide,
+  generateSeparatedClipsEdl,
   triggerFileDownload,
 } from '../engine/premiereXmlGenerator';
 
@@ -265,14 +266,28 @@ export const PremiereExportView: React.FC<PremiereExportViewProps> = ({
                     'application/x-subrip'
                   )
                 }
-                className="col-span-2 px-3 py-2 rounded-lg bg-[#0C0D11] hover:bg-[#1A1D26] disabled:opacity-45 disabled:pointer-events-none border border-white/[0.1] text-[12px] text-white inline-flex items-center justify-center gap-1.5"
+                className="px-3 py-2 rounded-lg bg-[#0C0D11] hover:bg-[#1A1D26] disabled:opacity-45 disabled:pointer-events-none border border-white/[0.1] text-[12px] text-white inline-flex items-center gap-1.5"
               >
                 <Download className="w-3.5 h-3.5 text-[#FACC15]" />
                 <span>
                   {project.motionGraphics.length > 0
-                    ? `Captions (.srt · ${project.motionGraphics.length} cues)`
-                    : 'Captions (.srt · none detected)'}
+                    ? `Captions .srt (${project.motionGraphics.length})`
+                    : 'Captions .srt (0)'}
                 </span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  triggerFileDownload(
+                    generateSeparatedClipsEdl(project),
+                    `${project.name}_Separated_Clips.edl`,
+                    'text/plain'
+                  )
+                }
+                className="px-3 py-2 rounded-lg bg-[#0C0D11] hover:bg-[#1A1D26] border border-white/[0.1] text-[12px] text-white inline-flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5 text-[#4ADE80]" />
+                <span>Clips .edl ({project.shots.length})</span>
               </button>
             </div>
           </div>
@@ -298,41 +313,47 @@ export const PremiereExportView: React.FC<PremiereExportViewProps> = ({
             </div>
           </div>
 
-          {/* Embedded Free FX vs Skipped Paid Summary */}
+          {/* Separated Premiere Package Layers Breakdown */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-[12px]">
             <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
-              <div className="text-[#7F869B]">Free Video FX</div>
-              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#4ADE80] mt-0.5">
-                {
-                  project.effects.filter(
-                    (e) => e.includedInTimeline !== false && e.licenseTier !== 'Paid / Third-Party'
-                  ).length
-                }
+              <div className="text-[#7F869B]">Separated Clips</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-white mt-0.5">
+                {project.shots.length}
               </div>
+              <div className="text-[10px] text-[#7F869B] mt-0.5">V1 + Clips/ + Bin</div>
             </div>
             <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
-              <div className="text-[#7F869B]">Free Audio FX</div>
+              <div className="text-[#7F869B]">Caption Layers</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#9B82FF] mt-0.5">
+                {project.motionGraphics.length}
+              </div>
+              <div className="text-[10px] text-[#7F869B] mt-0.5">V3/V4 + .svg + .srt</div>
+            </div>
+            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+              <div className="text-[#7F869B]">Sound Design Layers</div>
               <div className="text-[18px] font-mono tabular-nums font-semibold text-[#38BDF8] mt-0.5">
-                {
+                {(project.audio.sections?.length ?? 0) +
+                  (project.audio.sfxEvents?.length ?? 0) +
+                  (project.audio.voiceoverDetected ? 1 : 0)}
+              </div>
+              <div className="text-[10px] text-[#7F869B] mt-0.5">A2–A5 .wav Stems</div>
+            </div>
+            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
+              <div className="text-[#7F869B]">Free Video &amp; Audio FX</div>
+              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#4ADE80] mt-0.5">
+                {project.effects.filter(
+                  (e) => e.includedInTimeline !== false && e.licenseTier !== 'Paid / Third-Party'
+                ).length +
                   (project.audio.audioEffects ?? []).filter(
                     (e) => e.includedInTimeline && e.licenseTier === 'Free / Built-in'
-                  ).length
-                }
+                  ).length}
               </div>
-            </div>
-            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
-              <div className="text-[#7F869B]">Paid FX Skipped</div>
-              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#FBBF24] mt-0.5">
+              <div className="text-[10px] text-[#7F869B] mt-0.5">
                 {project.effects.filter((e) => e.licenseTier === 'Paid / Third-Party').length +
                   (project.audio.audioEffects ?? []).filter(
                     (e) => e.licenseTier === 'Paid / Third-Party'
-                  ).length}
-              </div>
-            </div>
-            <div className="p-3 rounded-lg bg-[#0C0D11] border border-white/[0.06]">
-              <div className="text-[#7F869B]">Captions &amp; Titles</div>
-              <div className="text-[18px] font-mono tabular-nums font-semibold text-[#9B82FF] mt-0.5">
-                {project.motionGraphics.length}
+                  ).length}{' '}
+                paid skipped
               </div>
             </div>
           </div>

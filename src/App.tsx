@@ -16,7 +16,11 @@ import type {
 import { computeComparisonMetrics } from './engine/comparisonEngine';
 import { clamp } from './engine/formatters';
 import { generateLocalSampleReel } from './engine/sampleReelGenerator';
-import { INITIAL_PIPELINE_STAGES, runFullVideoAnalysis } from './engine/videoAnalyzer';
+import {
+  INITIAL_PIPELINE_STAGES,
+  runFullVideoAnalysis,
+  runLinkBasedReconstruction,
+} from './engine/videoAnalyzer';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
 import { DashboardView } from './components/DashboardView';
@@ -154,31 +158,81 @@ export default function App() {
     });
   }, [activeProject]);
 
-  const handleInspectInstagramUrl = useCallback(async (url: string) => {
-    setInspectingUrl(true);
-    setAnalysisError(null);
-    try {
-      const res = await fetch('/api/instagram/inspect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
-      });
-      const data = (await res.json()) as InstagramInspectResult;
-      setInstagramResult(data);
-    } catch {
-      setInstagramResult({
-        valid: false,
-        url,
-        oEmbedAvailable: false,
-        oEmbedConfigured: false,
-        directVideoAvailable: false,
-        accessNotice: 'Failed to contact server Instagram URL inspector.',
-        error: 'Network error',
-      });
-    } finally {
-      setInspectingUrl(false);
-    }
-  }, []);
+  const handleAnalyzeInstagramLink = useCallback(
+    async (infoOverride?: InstagramInspectResult) => {
+      const targetInfo = infoOverride ?? instagramResult;
+      if (!targetInfo || !targetInfo.valid) return;
+
+      setIsPlaying(false);
+      setIsAnalyzing(true);
+      setAnalysisError(null);
+      setPipelineStages(INITIAL_PIPELINE_STAGES.map((s) => ({ ...s })));
+      setActivePage('video-analysis');
+
+      try {
+        const result = await runLinkBasedReconstruction({
+          instagramInfo: targetInfo,
+          settings,
+          onStageUpdate: setPipelineStages,
+        });
+
+        if (videoObjectUrl) {
+          URL.revokeObjectURL(videoObjectUrl);
+        }
+        setSourceFile(null);
+        setVideoObjectUrl(result.videoObjectUrl);
+        setActiveProject(result.project);
+        setUndoStack([]);
+        setRedoStack([]);
+        setCurrentTimeSec(0);
+        setSelectedShotId(result.project.shots[0]?.id ?? null);
+        setSelectedGraphicId(result.project.motionGraphics[0]?.id ?? null);
+        setSelectedEffectId(result.project.effects[0]?.id ?? null);
+        persistProject(result.project);
+      } catch (err) {
+        setAnalysisError(
+          err instanceof Error ? err.message : 'Link reconstruction failed unexpectedly.'
+        );
+      } finally {
+        setIsAnalyzing(false);
+      }
+    },
+    [instagramResult, settings, videoObjectUrl, persistProject]
+  );
+
+  const handleInspectInstagramUrl = useCallback(
+    async (url: string, autoBuild = false) => {
+      setInspectingUrl(true);
+      setAnalysisError(null);
+      try {
+        const res = await fetch('/api/instagram/inspect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        const data = (await res.json()) as InstagramInspectResult;
+        setInstagramResult(data);
+        if (data.valid && (autoBuild || data.directVideoAvailable)) {
+          setInspectingUrl(false);
+          await handleAnalyzeInstagramLink(data);
+          return;
+        }
+      } catch {
+        setInstagramResult({
+          valid: false,
+          url,
+          oEmbedAvailable: false,
+          oEmbedConfigured: false,
+          directVideoAvailable: false,
+          accessNotice: 'Failed to contact server Instagram URL inspector.',
+          error: 'Network error',
+        });
+      } finally {
+        setInspectingUrl(false);
+      }
+    },
+    [handleAnalyzeInstagramLink]
+  );
 
   const handleAnalyzeFile = useCallback(
     async (file: File, origin: 'instagram-upload' | 'direct-upload' | 'sample-reel') => {
@@ -549,6 +603,7 @@ export default function App() {
             instagramResult={instagramResult}
             inspectingUrl={inspectingUrl}
             onInspectInstagramUrl={handleInspectInstagramUrl}
+            onAnalyzeLink={() => handleAnalyzeInstagramLink()}
             onSelectVideoFile={(file, origin) => handleAnalyzeFile(file, origin)}
             onGenerateSampleReel={handleGenerateSampleReel}
             generatingSample={generatingSample}
@@ -569,7 +624,9 @@ export default function App() {
             onInstagramUrlChange={setInstagramUrl}
             result={instagramResult}
             inspecting={inspectingUrl}
+            isAnalyzing={isAnalyzing}
             onInspect={handleInspectInstagramUrl}
+            onAnalyzeLink={() => handleAnalyzeInstagramLink()}
             onUploadAuthorizedFile={(file) => handleAnalyzeFile(file, 'instagram-upload')}
           />
         );

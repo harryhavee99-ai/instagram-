@@ -23,7 +23,7 @@ export interface InstagramInspectResult {
   url: string;
   normalizedUrl?: string;
   shortcode?: string;
-  contentType?: 'Reel' | 'Video Post' | 'IGTV';
+  contentType?: 'Reel' | 'Video Post' | 'IGTV' | 'Direct Video';
   creatorHandle?: string;
   oEmbedAvailable: boolean;
   oEmbedConfigured: boolean;
@@ -35,8 +35,10 @@ export interface InstagramInspectResult {
     authorName?: string;
     authorUrl?: string;
     thumbnailUrl?: string;
+    thumbnailDataUrl?: string;
     thumbnailWidth?: number;
     thumbnailHeight?: number;
+    directVideoUrl?: string;
     providerName?: string;
     aspectRatio?: string;
     estimatedDurationSec?: number;
@@ -64,7 +66,7 @@ export interface VideoMetadata {
   colorSpace: string;
   hdrDetected: boolean;
   proxyScale: number;
-  sourceOrigin: 'instagram-upload' | 'direct-upload' | 'sample-reel';
+  sourceOrigin: 'instagram-upload' | 'instagram-link' | 'direct-upload' | 'sample-reel';
   sourceUrl?: string;
 }
 

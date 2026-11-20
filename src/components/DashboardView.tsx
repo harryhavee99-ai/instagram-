@@ -22,7 +22,8 @@ interface DashboardViewProps {
   onInstagramUrlChange: (url: string) => void;
   instagramResult: InstagramInspectResult | null;
   inspectingUrl: boolean;
-  onInspectInstagramUrl: (url: string) => Promise<void>;
+  onInspectInstagramUrl: (url: string, autoBuild?: boolean) => Promise<void>;
+  onAnalyzeLink: () => void;
   onSelectVideoFile: (file: File, origin: 'instagram-upload' | 'direct-upload') => void;
   onGenerateSampleReel: () => Promise<void>;
   generatingSample: boolean;
@@ -41,6 +42,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   instagramResult,
   inspectingUrl,
   onInspectInstagramUrl,
+  onAnalyzeLink,
   onSelectVideoFile,
   onGenerateSampleReel,
   generatingSample,
@@ -58,7 +60,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const handleSubmitUrl = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!instagramUrl.trim()) return;
-    await onInspectInstagramUrl(instagramUrl);
+    await onInspectInstagramUrl(instagramUrl, true);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -165,13 +167,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
               </div>
               {instagramResult.valid && (
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="px-3.5 py-2 rounded-lg bg-[#3B82F6] hover:bg-[#2563EB] text-white text-[12px] font-medium whitespace-nowrap shrink-0 transition-colors"
-                >
-                  Attach Authorized Video
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    disabled={isAnalyzing}
+                    onClick={onAnalyzeLink}
+                    className="px-3.5 py-2 rounded-lg bg-[#7C5CFF] hover:bg-[#6D4BF0] disabled:opacity-45 text-white text-[12px] font-medium whitespace-nowrap transition-colors"
+                  >
+                    Build Premiere Project
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-3 py-2 rounded-lg bg-[#1A1D26] hover:bg-[#232736] border border-white/[0.12] text-[#D4D8E3] text-[12px] font-medium whitespace-nowrap transition-colors"
+                  >
+                    Attach Local MP4
+                  </button>
+                </div>
               )}
             </div>
           </div>

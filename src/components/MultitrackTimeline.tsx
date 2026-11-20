@@ -161,7 +161,7 @@ export const MultitrackTimeline: React.FC<MultitrackTimelineProps> = ({
             {/* Video Tracks */}
             <div className={`${expanded ? 'h-12' : 'h-9'} px-3 flex items-center justify-between text-[12px]`}>
               <span className="font-mono text-[#9B82FF] text-[11px]">V3</span>
-              <span className="text-[#A5ACBF] truncate ml-2 flex-1">Titles & GFX</span>
+              <span className="text-[#A5ACBF] truncate ml-2 flex-1">Captions Layer</span>
             </div>
             <div className={`${expanded ? 'h-12' : 'h-9'} px-3 flex items-center justify-between text-[12px]`}>
               <span className="font-mono text-[#3B82F6] text-[11px]">V2</span>
@@ -169,7 +169,7 @@ export const MultitrackTimeline: React.FC<MultitrackTimelineProps> = ({
             </div>
             <div className={`${expanded ? 'h-16' : 'h-13'} px-3 flex items-center justify-between text-[12px]`}>
               <span className="font-mono text-[#7C5CFF] text-[11px]">V1</span>
-              <span className="text-white font-medium truncate ml-2 flex-1">Main Video</span>
+              <span className="text-white font-medium truncate ml-2 flex-1">Separated Clips</span>
             </div>
 
             {/* Audio Tracks */}

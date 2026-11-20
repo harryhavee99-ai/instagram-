@@ -5,9 +5,17 @@ import type {
   EffectItem,
   MotionGraphicItem,
   ReelProject,
+  ShotClip,
 } from '../types/project';
 import { generateSrtSubtitles, hexToRgba } from './captionPresets';
-import { clamp, formatTimecodeMs } from './formatters';
+import { clamp, formatSmpte, formatTimecodeMs } from './formatters';
+import {
+  generateMusicSectionWav,
+  generateSfxWav,
+  generateVoiceoverCueWav,
+  splitGraphicsToCaptionLanes,
+  splitSfxToAudioLanes,
+} from './wavAudioGenerator';
 
 function escapeXml(value: string): string {
   return value
@@ -685,17 +693,23 @@ export function generatePremiereXmeml(
     return blocks.join('');
   };
 
-  // Build Video Track 3 (Editable SVG/Graphic caption & title plates with keyframed animations)
-  const v3Items = project.motionGraphics.map((gfx, idx) => {
+  // Build Video Tracks V3 (Primary Captions) & V4 (Secondary Captions / Titles — zero collisions)
+  const graphicFileIndexMap = new Map<string, { idx: number; fileName: string }>();
+  project.motionGraphics.forEach((gfx, idx) => {
+    const prefix = gfx.isCaption || gfx.type === 'Caption' || gfx.type === 'Subtitle' ? 'Caption' : 'Title';
+    const gfxFileName = `${prefix}_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
+    graphicFileIndexMap.set(gfx.id, { idx, fileName: gfxFileName });
+  });
+
+  const renderGraphicClipXml = (gfx: MotionGraphicItem, trackLabel: 'v3' | 'v4') => {
+    const meta = graphicFileIndexMap.get(gfx.id)!;
     const startF = toFrames(gfx.startTimeSec, timebase);
     const endF = Math.max(startF + 2, toFrames(gfx.endTimeSec, timebase));
     const durF = endF - startF;
-    const prefix = gfx.isCaption || gfx.type === 'Caption' || gfx.type === 'Subtitle' ? 'Caption' : 'Title';
-    const gfxFileName = `${prefix}_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
     const animFilters = buildGraphicAnimationFiltersXml(gfx, durF);
 
     return `
-          <clipitem id="v3-gfx-${idx + 1}">
+          <clipitem id="${trackLabel}-gfx-${meta.idx + 1}">
             <name>${escapeXml(gfx.text)}</name>
             <enabled>TRUE</enabled>
             <duration>${durF}</duration>
@@ -707,9 +721,9 @@ export function generatePremiereXmeml(
             <end>${endF}</end>
             <in>0</in>
             <out>${durF}</out>
-            <file id="gfx-file-${idx + 1}">
-              <name>${escapeXml(gfxFileName)}</name>
-              <pathurl>${escapeXml(`file://localhost/Graphics/${gfxFileName}`)}</pathurl>
+            <file id="gfx-file-${meta.idx + 1}">
+              <name>${escapeXml(meta.fileName)}</name>
+              <pathurl>${escapeXml(`file://localhost/Graphics/${meta.fileName}`)}</pathurl>
               <rate>
                 <timebase>${timebase}</timebase>
                 <ntsc>FALSE</ntsc>
@@ -728,7 +742,294 @@ export function generatePremiereXmeml(
               <mastercomment1>${escapeXml(`${gfx.type} | Preset: ${gfx.captionStylePreset || 'Custom'} | Font: ${gfx.fontFamily} ${gfx.fontSize}px | Anim: ${gfx.animationType}${gfx.spellChecked ? ' | Spellcheck Verified' : ''}`)}</mastercomment1>
             </comments>
           </clipitem>`;
+  };
+
+  const { v3Primary, v4Secondary } = splitGraphicsToCaptionLanes(project.motionGraphics);
+  const v3Items = v3Primary.map((gfx) => renderGraphicClipXml(gfx, 'v3'));
+  const v4Items = v4Secondary.map((gfx) => renderGraphicClipXml(gfx, 'v4'));
+
+  // Build Track A2: Separate Background Music / Beat Reference Sections (Audio/Music/*.wav)
+  const a2Track = project.audio.tracks.find((t) => t.id === 'A2');
+  const a2GainLinear = a2Track ? Math.pow(10, a2Track.volumeDb / 20) : 0.72;
+  const musicSections = project.audio.sections ?? [];
+  const a2Items = musicSections.map((sec, idx) => {
+    const startF = toFrames(sec.startTimeSec, timebase);
+    const endF = Math.max(startF + 4, toFrames(sec.endTimeSec, timebase));
+    const durF = endF - startF;
+    const musicFileName = `Music_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(sec.name).slice(0, 24)}.wav`;
+    return `
+              <clipitem id="a2-music-${idx + 1}">
+                <name>${escapeXml(`Music — ${sec.name}`)}</name>
+                <enabled>${a2Track?.muted ? 'FALSE' : 'TRUE'}</enabled>
+                <duration>${durF}</duration>
+                <rate>
+                  <timebase>${timebase}</timebase>
+                  <ntsc>FALSE</ntsc>
+                </rate>
+                <start>${startF}</start>
+                <end>${endF}</end>
+                <in>0</in>
+                <out>${durF}</out>
+                <file id="music-file-${idx + 1}">
+                  <name>${escapeXml(musicFileName)}</name>
+                  <pathurl>${escapeXml(`file://localhost/Audio/Music/${musicFileName}`)}</pathurl>
+                  <rate>
+                    <timebase>${timebase}</timebase>
+                    <ntsc>FALSE</ntsc>
+                  </rate>
+                  <duration>${durF}</duration>
+                  <media>
+                    <audio>
+                      <samplecharacteristics>
+                        <depth>16</depth>
+                        <samplerate>48000</samplerate>
+                      </samplecharacteristics>
+                      <channelcount>2</channelcount>
+                    </audio>
+                  </media>
+                </file>
+                <sourcetrack>
+                  <mediatype>audio</mediatype>
+                  <trackindex>1</trackindex>
+                </sourcetrack>
+                <filter>
+                  <effect>
+                    <name>Audio Levels</name>
+                    <effectid>audiolevels</effectid>
+                    <effectcategory>audiolevels</effectcategory>
+                    <effecttype>audiolevels</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>level</parameterid>
+                      <name>Level</name>
+                      <valuemin>0</valuemin>
+                      <valuemax>3.98109</valuemax>
+                      <value>${a2GainLinear.toFixed(3)}</value>
+                    </parameter>
+                  </effect>
+                </filter>
+                <comments>
+                  <mastercomment1>${escapeXml(`Music Section: ${sec.name} | Energy: ${sec.energyLevel}% | ${project.audio.estimatedBpm || 120} BPM`)}</mastercomment1>
+                </comments>
+              </clipitem>`;
   });
+
+  // Build Track A3 (Primary Sound Design SFX) & Track A4 (Layered / Overlapping Sound Design SFX)
+  const a3Track = project.audio.tracks.find((t) => t.id === 'A3');
+  const sfxIndexMap = new Map<string, { idx: number; fileName: string }>();
+  (project.audio.sfxEvents ?? []).forEach((sfx, idx) => {
+    const fileName = `SFX_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(sfx.category)}_${sanitizeFileName(sfx.label).slice(0, 20)}.wav`;
+    sfxIndexMap.set(sfx.id, { idx, fileName });
+  });
+
+  const renderSfxClipXml = (
+    sfx: (typeof project.audio.sfxEvents)[number] & { startTimeSec: number; endTimeSec: number },
+    laneId: 'a3' | 'a4'
+  ) => {
+    const meta = sfxIndexMap.get(sfx.id)!;
+    const startF = toFrames(sfx.startTimeSec, timebase);
+    const endF = Math.max(startF + 3, toFrames(sfx.endTimeSec, timebase));
+    const durF = endF - startF;
+    const gainLin = Math.pow(10, (sfx.volumeDb ?? -2) / 20);
+    return `
+              <clipitem id="${laneId}-sfx-${meta.idx + 1}">
+                <name>${escapeXml(`${sfx.category}: ${sfx.label}`)}</name>
+                <enabled>${a3Track?.muted ? 'FALSE' : 'TRUE'}</enabled>
+                <duration>${durF}</duration>
+                <rate>
+                  <timebase>${timebase}</timebase>
+                  <ntsc>FALSE</ntsc>
+                </rate>
+                <start>${startF}</start>
+                <end>${endF}</end>
+                <in>0</in>
+                <out>${durF}</out>
+                <file id="sfx-file-${meta.idx + 1}">
+                  <name>${escapeXml(meta.fileName)}</name>
+                  <pathurl>${escapeXml(`file://localhost/Audio/SFX/${meta.fileName}`)}</pathurl>
+                  <rate>
+                    <timebase>${timebase}</timebase>
+                    <ntsc>FALSE</ntsc>
+                  </rate>
+                  <duration>${durF}</duration>
+                  <media>
+                    <audio>
+                      <samplecharacteristics>
+                        <depth>16</depth>
+                        <samplerate>48000</samplerate>
+                      </samplecharacteristics>
+                      <channelcount>2</channelcount>
+                    </audio>
+                  </media>
+                </file>
+                <sourcetrack>
+                  <mediatype>audio</mediatype>
+                  <trackindex>1</trackindex>
+                </sourcetrack>
+                <filter>
+                  <effect>
+                    <name>Audio Levels</name>
+                    <effectid>audiolevels</effectid>
+                    <effectcategory>audiolevels</effectcategory>
+                    <effecttype>audiolevels</effecttype>
+                    <mediatype>audio</mediatype>
+                    <parameter>
+                      <parameterid>level</parameterid>
+                      <name>Level</name>
+                      <valuemin>0</valuemin>
+                      <valuemax>3.98109</valuemax>
+                      <value>${gainLin.toFixed(3)}</value>
+                    </parameter>
+                  </effect>
+                </filter>
+                <comments>
+                  <mastercomment1>${escapeXml(`SFX ${sfx.category} | Cue: ${sfx.linkedVisualEvent}`)}</mastercomment1>
+                </comments>
+              </clipitem>`;
+  };
+
+  const { a3Primary, a4Secondary } = splitSfxToAudioLanes(project.audio.sfxEvents ?? []);
+  const a3Items = a3Primary.map((s) => renderSfxClipXml(s, 'a3'));
+  const a4Items = a4Secondary.map((s) => renderSfxClipXml(s, 'a4'));
+
+  // Build Track A5: Separate Voiceover / Dialogue Cue Layer
+  const a4UiTrack = project.audio.tracks.find((t) => t.id === 'A4');
+  const voSegments: Array<{ idx: number; label: string; startSec: number; endSec: number; fileName: string }> = [];
+  if (project.audio.voiceoverDetected) {
+    if (project.motionGraphics.length > 0) {
+      project.motionGraphics.forEach((g, idx) => {
+        const clean = sanitizeFileName(g.text).slice(0, 20);
+        voSegments.push({
+          idx,
+          label: `VO_${String(idx + 1).padStart(2, '0')} — ${g.text.slice(0, 28)}`,
+          startSec: g.startTimeSec,
+          endSec: Math.max(g.startTimeSec + 0.3, g.endTimeSec),
+          fileName: `VO_${String(idx + 1).padStart(2, '0')}_${clean}.wav`,
+        });
+      });
+    } else {
+      voSegments.push({
+        idx: 0,
+        label: 'VO_01 — Full Dialogue / Voiceover Guide',
+        startSec: 0,
+        endSec: project.metadata.durationSec,
+        fileName: 'VO_01_Full_Dialogue_Guide.wav',
+      });
+    }
+  }
+
+  const a5Items = voSegments.map((seg) => {
+    const startF = toFrames(seg.startSec, timebase);
+    const endF = Math.max(startF + 3, toFrames(seg.endSec, timebase));
+    const durF = endF - startF;
+    return `
+              <clipitem id="a5-vo-${seg.idx + 1}">
+                <name>${escapeXml(seg.label)}</name>
+                <enabled>${a4UiTrack?.muted ? 'FALSE' : 'TRUE'}</enabled>
+                <duration>${durF}</duration>
+                <rate>
+                  <timebase>${timebase}</timebase>
+                  <ntsc>FALSE</ntsc>
+                </rate>
+                <start>${startF}</start>
+                <end>${endF}</end>
+                <in>0</in>
+                <out>${durF}</out>
+                <file id="vo-file-${seg.idx + 1}">
+                  <name>${escapeXml(seg.fileName)}</name>
+                  <pathurl>${escapeXml(`file://localhost/Audio/Voiceover/${seg.fileName}`)}</pathurl>
+                  <rate>
+                    <timebase>${timebase}</timebase>
+                    <ntsc>FALSE</ntsc>
+                  </rate>
+                  <duration>${durF}</duration>
+                  <media>
+                    <audio>
+                      <samplecharacteristics>
+                        <depth>16</depth>
+                        <samplerate>48000</samplerate>
+                      </samplecharacteristics>
+                      <channelcount>2</channelcount>
+                    </audio>
+                  </media>
+                </file>
+                <sourcetrack>
+                  <mediatype>audio</mediatype>
+                  <trackindex>1</trackindex>
+                </sourcetrack>
+              </clipitem>`;
+  });
+
+  // Build Adobe Premiere Pro Project Panel Bins (Separated Clips, Caption Layers, Sound Design Stems)
+  const separatedClipBinItems = project.shots
+    .map((shot, idx) => {
+      const inF = toFrames(shot.startTimeSec, timebase);
+      const outF = Math.max(inF + 2, toFrames(shot.endTimeSec, timebase));
+      const durF = outF - inF;
+      return `
+          <clip id="subclip-${idx + 1}">
+            <name>${escapeXml(`Clip_${String(idx + 1).padStart(2, '0')}_${shot.name}`)}</name>
+            <duration>${durF}</duration>
+            <rate>
+              <timebase>${timebase}</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <in>${inF}</in>
+            <out>${outF}</out>
+            <masterclipid>master-clip-1</masterclipid>
+            <issubclip>TRUE</issubclip>
+            <subclipinfo>
+              <startoffset>${inF}</startoffset>
+              <endoffset>${Math.max(0, totalFrames - outF)}</endoffset>
+            </subclipinfo>
+            <file id="master-source-file-1"/>
+            <comments>
+              <mastercomment1>${escapeXml(`${shot.shotType} | ${shot.cameraMovement} | ${shot.speedPercent}% | Out: ${shot.transitionOut.type}`)}</mastercomment1>
+            </comments>
+          </clip>`;
+    })
+    .join('');
+
+  const captionBinItems = project.motionGraphics
+    .map((gfx, idx) => {
+      const meta = graphicFileIndexMap.get(gfx.id)!;
+      const durF = Math.max(2, toFrames(gfx.endTimeSec - gfx.startTimeSec, timebase));
+      return `
+          <clip id="bin-gfx-${idx + 1}">
+            <name>${escapeXml(meta.fileName)}</name>
+            <duration>${durF}</duration>
+            <rate>
+              <timebase>${timebase}</timebase>
+              <ntsc>FALSE</ntsc>
+            </rate>
+            <file id="gfx-file-${idx + 1}"/>
+          </clip>`;
+    })
+    .join('');
+
+  const soundDesignBinItems = [
+    ...musicSections.map((sec, idx) => `
+          <clip id="bin-music-${idx + 1}">
+            <name>${escapeXml(`Music_${String(idx + 1).padStart(2, '0')}_${sec.name}`)}</name>
+            <duration>${Math.max(4, toFrames(sec.endTimeSec - sec.startTimeSec, timebase))}</duration>
+            <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+            <file id="music-file-${idx + 1}"/>
+          </clip>`),
+    ...(project.audio.sfxEvents ?? []).map((sfx, idx) => `
+          <clip id="bin-sfx-${idx + 1}">
+            <name>${escapeXml(`SFX_${String(idx + 1).padStart(2, '0')}_${sfx.category}_${sfx.label}`)}</name>
+            <duration>${Math.max(3, toFrames(sfx.durationSec || 0.35, timebase))}</duration>
+            <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+            <file id="sfx-file-${idx + 1}"/>
+          </clip>`),
+    ...voSegments.map((seg) => `
+          <clip id="bin-vo-${seg.idx + 1}">
+            <name>${escapeXml(seg.label)}</name>
+            <duration>${Math.max(3, toFrames(seg.endSec - seg.startSec, timebase))}</duration>
+            <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+            <file id="vo-file-${seg.idx + 1}"/>
+          </clip>`),
+  ].join('');
 
   // Sequence beat + shot markers for Premiere Pro timeline
   const markersXml: string[] = [];
@@ -808,6 +1109,21 @@ export function generatePremiereXmeml(
   <project>
     <name>${safeProjectName}</name>
     <children>
+      <bin>
+        <name>01_Separated_Clips</name>
+        <children>${separatedClipBinItems}
+        </children>
+      </bin>
+      <bin>
+        <name>02_Caption_Layers</name>
+        <children>${captionBinItems}
+        </children>
+      </bin>
+      <bin>
+        <name>03_Sound_Design_Layers</name>
+        <children>${soundDesignBinItems}
+        </children>
+      </bin>
       <sequence id="reel2premiere-seq-1">
         <name>${safeProjectName}_Reconstructed</name>
         <duration>${totalFrames}</duration>
@@ -841,17 +1157,22 @@ export function generatePremiereXmeml(
               </samplecharacteristics>
             </format>
             <track>
-              <!-- V1: Main Reconstructed Video Cuts -->${v1Items.join('')}
+              <!-- V1: Separated Video Clips (Individual Cuts + Transitions + Free Video FX) -->${v1Items.join('')}
               <enabled>TRUE</enabled>
               <locked>FALSE</locked>
             </track>
             <track>
-              <!-- V2: Secondary / Overlay / Adjustment Layer Track -->
+              <!-- V2: Color Adjustment Layer / LUT Reference Track -->
               <enabled>TRUE</enabled>
               <locked>FALSE</locked>
             </track>
             <track>
-              <!-- V3: Reconstructed OCR Titles & Motion Graphics -->${v3Items.join('')}
+              <!-- V3: Captions Layer — Primary (Styled & Animated SVG Plates) -->${v3Items.join('')}
+              <enabled>TRUE</enabled>
+              <locked>FALSE</locked>
+            </track>
+            <track>
+              <!-- V4: Captions & Titles Layer — Secondary (Non-Overlapping Overflow) -->${v4Items.join('')}
               <enabled>TRUE</enabled>
               <locked>FALSE</locked>
             </track>
@@ -865,7 +1186,7 @@ export function generatePremiereXmeml(
               </samplecharacteristics>
             </format>
             <track>
-              <!-- A1: Original Authorized Source Audio -->
+              <!-- A1: Original Authorized Source Audio + Free Audio FX -->
               <clipitem id="a1-original-audio">
                 <masterclipid>master-clip-1</masterclipid>
                 <name>${escapeXml(sourceFileName)} (Audio)</name>
@@ -905,18 +1226,23 @@ export function generatePremiereXmeml(
               <locked>FALSE</locked>
             </track>
             <track>
-              <!-- A2: Background Music Reference Track (Drop licensed music here; see Beat Markers) -->
-              <enabled>TRUE</enabled>
+              <!-- A2: Background Music / Beat Reference Sections (Audio/Music/*.wav) -->${a2Items.join('')}
+              <enabled>${a2Track?.muted ? 'FALSE' : 'TRUE'}</enabled>
               <locked>FALSE</locked>
             </track>
             <track>
-              <!-- A3: Sound Effects Track (Aligned to SFX Markers) -->
-              <enabled>TRUE</enabled>
+              <!-- A3: Sound Design SFX Layer — Primary (Whoosh, Impact, Riser, Drop, Click) -->${a3Items.join('')}
+              <enabled>${a3Track?.muted ? 'FALSE' : 'TRUE'}</enabled>
               <locked>FALSE</locked>
             </track>
             <track>
-              <!-- A4: Voiceover / Dialogue Track -->
-              <enabled>TRUE</enabled>
+              <!-- A4: Sound Design SFX Layer — Layered / Secondary Hits -->${a4Items.join('')}
+              <enabled>${a3Track?.muted ? 'FALSE' : 'TRUE'}</enabled>
+              <locked>FALSE</locked>
+            </track>
+            <track>
+              <!-- A5: Voiceover / Dialogue Layer (Aligned to Speech & Caption Cues) -->${a5Items.join('')}
+              <enabled>${a4UiTrack?.muted ? 'FALSE' : 'TRUE'}</enabled>
               <locked>FALSE</locked>
             </track>
           </audio>
@@ -926,6 +1252,123 @@ export function generatePremiereXmeml(
   </project>
 </xmeml>
 `;
+}
+
+/**
+ * Generates a standard CMX 3600 Edit Decision List (.edl) listing every separated clip.
+ */
+export function generateSeparatedClipsEdl(project: ReelProject): string {
+  const fps = Math.max(15, Math.round(project.metadata.fps || 30));
+  const lines: string[] = [
+    `TITLE: ${project.name.toUpperCase()} - SEPARATED CLIPS`,
+    `FCM: NON-DROP FRAME`,
+    ``,
+  ];
+
+  project.shots.forEach((shot, idx) => {
+    const editNum = String(idx + 1).padStart(3, '0');
+    const tcIn = formatSmpte(shot.startTimeSec, fps);
+    const tcOut = formatSmpte(shot.endTimeSec, fps);
+    const transCode = shot.transitionOut.type === 'Cut' ? 'C   ' : 'D   ';
+    lines.push(
+      `${editNum}  CLIP${String(idx + 1).padStart(2, '0')}   V     ${transCode}        ${tcIn} ${tcOut} ${tcIn} ${tcOut}`,
+      `* FROM CLIP NAME: Clip_${String(idx + 1).padStart(2, '0')}_${shot.name}`,
+      `* COMMENT: ${shot.shotType} | ${shot.cameraMovement} | Speed ${shot.speedPercent}% | Out: ${shot.transitionOut.type}`,
+      ``
+    );
+  });
+
+  return lines.join('\n');
+}
+
+/**
+ * Generates a clean CSV cut sheet of all separated clips for editors and assistants.
+ */
+export function generateSeparatedClipsCsv(project: ReelProject): string {
+  const header = 'Clip Number,Clip Name,Section,Shot Type,Start (s),End (s),Duration (s),Camera Movement,Speed (%),Transition Out,Beat Synced';
+  const rows = project.shots.map((s, idx) =>
+    [
+      `Clip_${String(idx + 1).padStart(2, '0')}`,
+      `"${s.name.replace(/"/g, '""')}"`,
+      `"${s.section}"`,
+      `"${s.shotType}"`,
+      s.startTimeSec.toFixed(3),
+      s.endTimeSec.toFixed(3),
+      s.durationSec.toFixed(3),
+      `"${s.cameraMovement.replace(/"/g, '""')}"`,
+      s.speedPercent,
+      `"${s.transitionOut.type}"`,
+      s.beatAligned ? 'Yes' : 'No',
+    ].join(',')
+  );
+  return [header, ...rows].join('\n');
+}
+
+/**
+ * Generates a standalone single-clip Premiere Pro XMEML subclip file so every
+ * individual clip can also be imported separately if desired.
+ */
+export function generateStandaloneSubclipXml(
+  project: ReelProject,
+  shot: ShotClip,
+  idx: number,
+  options?: { timebaseOverride?: number; widthOverride?: number; heightOverride?: number }
+): string {
+  const timebase = Math.max(15, Math.round(options?.timebaseOverride || project.metadata.fps || 30));
+  const width = options?.widthOverride || project.metadata.width || 1080;
+  const height = options?.heightOverride || project.metadata.height || 1920;
+  const sourceFileName = sanitizeFileName(project.metadata.fileName || 'Source_Reel.mp4');
+  const inF = toFrames(shot.startTimeSec, timebase);
+  const outF = Math.max(inF + 2, toFrames(shot.endTimeSec, timebase));
+  const durF = outF - inF;
+  const totalFrames = Math.max(outF, toFrames(project.metadata.durationSec, timebase));
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="4">
+  <sequence id="subclip-seq-${idx + 1}">
+    <name>${escapeXml(`Clip_${String(idx + 1).padStart(2, '0')}_${shot.name}`)}</name>
+    <duration>${durF}</duration>
+    <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+    <media>
+      <video>
+        <format>
+          <samplecharacteristics>
+            <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+            <width>${width}</width>
+            <height>${height}</height>
+          </samplecharacteristics>
+        </format>
+        <track>
+          <clipitem id="solo-clip-${idx + 1}">
+            <name>${escapeXml(`Clip_${String(idx + 1).padStart(2, '0')}_${shot.name}`)}</name>
+            <enabled>TRUE</enabled>
+            <duration>${totalFrames}</duration>
+            <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+            <start>0</start>
+            <end>${durF}</end>
+            <in>${inF}</in>
+            <out>${outF}</out>
+            <file id="solo-source-file-${idx + 1}">
+              <name>${escapeXml(sourceFileName)}</name>
+              <pathurl>${escapeXml(`file://localhost/Media/${sourceFileName}`)}</pathurl>
+              <rate><timebase>${timebase}</timebase><ntsc>FALSE</ntsc></rate>
+              <duration>${totalFrames}</duration>
+              <media>
+                <video>
+                  <samplecharacteristics>
+                    <width>${width}</width>
+                    <height>${height}</height>
+                  </samplecharacteristics>
+                </video>
+              </media>
+            </file>
+          </clipitem>
+        </track>
+      </video>
+    </media>
+  </sequence>
+</xmeml>`;
 }
 
 /**
@@ -1229,29 +1672,35 @@ Sequence: ${project.metadata.width}x${project.metadata.height} @ ${project.metad
 
 1. EXTRACT THIS PACKAGE
    Unzip the entire folder to your local editing drive before opening Adobe Premiere Pro.
-    Keep the relative folder structure intact:
-   - Project/Reel2Premiere_Sequence.xml
+   Keep the relative folder structure intact:
+   - Project/${sanitizeFileName(project.name)}_Premiere.xml
    - Media/${sourceFileName}
+   - Clips/ (Separated individual Clip_01..xml subclips, CMX 3600 .edl, CSV cut sheet, Keyframes)
+   - Graphics/ (Styled transparent vector Caption_*.svg & Title_*.svg plates)
+   - Captions/${sanitizeFileName(project.name)}_Captions.srt
+   - Audio/Music/ (Tempo-synced Music section .wav stems for Track A2)
+   - Audio/SFX/ (Individual Sound Design Whoosh/Impact/Riser/Drop .wav stems for Tracks A3 & A4)
+   - Audio/Voiceover/ (Aligned Voiceover/Dialogue cue .wav stems for Track A5)
    - LUTs/Reconstructed_Look.cube
-   - Graphics/Caption_*.svg & Title_*.svg
-   - Captions/${sanitizeFileName(project.name)}_Captions.srt (if captions were detected)
-   - Manifests/
-   - Reports/
+   - Manifests/ & Reports/
 
 2. IMPORT INTO ADOBE PREMIERE PRO
    - Open Adobe Premiere Pro and create or open a project.
    - Go to File > Import... (Ctrl+I / Cmd+I).
-   - Select: Project/Reel2Premiere_Sequence.xml
-   - Double-click the imported sequence "${project.name}_Reconstructed" in the Project Panel.
+   - Select: Project/${sanitizeFileName(project.name)}_Premiere.xml
+   - In the Project Panel, you will see 3 organized bins plus the master sequence:
+     • 01_Separated_Clips (every shot clip separated individually)
+     • 02_Caption_Layers (every caption SVG graphic layer)
+     • 03_Sound_Design_Layers (every Music, SFX & Voiceover .wav layer)
+   - Double-click "${project.name}_Reconstructed" to open the full multitrack timeline.
 
 3. RELINK MEDIA (IF PROMPTED)
    - If Premiere Pro opens the "Link Media" dialog for ${sourceFileName}:
-     Click "Locate...", navigate to the Media/ folder inside this extracted ZIP,
-     select ${sourceFileName}, and click OK.
-   - Repeat for any Graphics/Caption_*.svg or Title_*.svg plates if Premiere requests their path.
+     Click "Locate...", navigate to Media/${sourceFileName} (or your local original MP4), and click OK.
+   - All Graphics/Caption_*.svg and Audio/**/*.wav stems live inside this extracted ZIP folder.
 
-4. EDITABLE CAPTIONS (.srt + ANIMATED TRACK V3)
-   - Styled & keyframe-animated caption plates are already placed on Track V3.
+4. EDITABLE CAPTIONS (TRACK V3 / V4 + .SRT)
+   - Styled & keyframe-animated caption plates are placed on Track V3 (and Track V4 if layered).
    - For native Premiere Pro Text Panel / Essential Graphics captions, import
      Captions/${sanitizeFileName(project.name)}_Captions.srt via File > Import... and drag it
      onto the sequence Captions track.
@@ -1260,18 +1709,17 @@ Sequence: ${project.metadata.width}x${project.metadata.height} @ ${project.metad
    - Add an Adjustment Layer on Track V2 spanning the sequence (or select clips on V1).
    - Open Window > Lumetri Color > Creative (or Basic Correction > Input LUT).
    - Browse and select: LUTs/Reconstructed_Look.cube
-   - Adjust Intensity slider to taste. Note: Estimated color grades are approximations
-     derived from rendered pixels; fine-tune skin tones using Lumetri Scopes.
 
-6. AUDIO & BEAT MARKERS
-   - Sequence markers on the timeline ruler mark every detected beat (${project.audio.estimatedBpm || 'N/A'} BPM)
-     and transition SFX cue.
-   - Track A1 contains your authorized source audio with Free / Built-in Premiere audio effects.
-   - Track A2 is reserved for a licensed music replacement if redistributing the project.
-   - Track A3 is reserved for sound effects (whooshes, impacts, risers).
+6. SEPARATED SOUND DESIGN LAYERS (TRACKS A1 – A5)
+   - Track A1: Original source audio + Free / Built-in Premiere audio effects.
+   - Track A2: Background Music / Beat Reference sections (Audio/Music/*.wav).
+   - Track A3: Primary Sound Design SFX clips — Whoosh, Impact, Riser, Drop, Click (Audio/SFX/*.wav).
+   - Track A4: Layered / Secondary Sound Design SFX hits (non-overlapping overflow).
+   - Track A5: Voiceover / Dialogue guide segments aligned to speech/caption cues (Audio/Voiceover/*.wav).
+   - Sequence markers on the timeline ruler mark every detected beat (${project.audio.estimatedBpm || 'N/A'} BPM) and SFX cue.
 
 7. REVIEW COMPATIBILITY REPORT
-   - Open Reports/Reconstruction_Report.md for a full list of native vs. approximate effects.
+   - Open Reports/Reconstruction_Report.md for a full shot-by-shot breakdown.
 `;
 }
 
@@ -1306,7 +1754,28 @@ export async function buildPremiereZipBlob(
     zip.file(`LUTs/Reconstructed_Look.cube`, lutText);
   }
 
-  // Generate transparent styled SVG graphic plates for every detected caption / motion graphic
+  // 1. Separated Clips folder: CMX 3600 EDL, CSV cut sheet, individual standalone subclip XMLs & keyframe stills
+  zip.file(`Clips/${safeBase}_Separated_Clips.edl`, generateSeparatedClipsEdl(project));
+  zip.file(`Clips/Separated_Clips_CutList.csv`, generateSeparatedClipsCsv(project));
+  project.shots.forEach((shot, idx) => {
+    const clipPrefix = `Clip_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(shot.name).slice(0, 24)}`;
+    zip.file(
+      `Clips/${clipPrefix}.xml`,
+      generateStandaloneSubclipXml(project, shot, idx, {
+        timebaseOverride: options.timebaseOverride,
+        widthOverride: options.widthOverride,
+        heightOverride: options.heightOverride,
+      })
+    );
+    if (shot.thumbnailDataUrl && shot.thumbnailDataUrl.includes('base64,')) {
+      const b64 = shot.thumbnailDataUrl.split('base64,')[1];
+      if (b64 && b64.length > 50) {
+        zip.file(`Clips/${clipPrefix}_Frame.jpg`, b64, { base64: true });
+      }
+    }
+  });
+
+  // 2. Separate Caption & Title Layers: styled transparent vector SVG plates + Premiere .srt
   project.motionGraphics.forEach((gfx, idx) => {
     const prefix = gfx.isCaption || gfx.type === 'Caption' || gfx.type === 'Subtitle' ? 'Caption' : 'Title';
     const gfxName = `${prefix}_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(gfx.text).slice(0, 24)}.svg`;
@@ -1318,10 +1787,36 @@ export async function buildPremiereZipBlob(
     zip.file(`Graphics/${gfxName}`, svg);
   });
 
-  // Bundle Premiere-importable SubRip (.srt) captions whenever captions/text exist
   const srtText = generateSrtSubtitles(project.motionGraphics);
   if (srtText.trim().length > 0) {
     zip.file(`Captions/${safeBase}_Captions.srt`, srtText);
+  }
+
+  // 3. Separate Sound Design Layers: real 48kHz 16-bit stereo WAV stems for Music (A2), SFX (A3/A4), and Voiceover (A5)
+  (project.audio.sections ?? []).forEach((sec, idx) => {
+    const musicName = `Music_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(sec.name).slice(0, 24)}.wav`;
+    const wavBytes = generateMusicSectionWav(sec, project.audio.estimatedBpm || 120);
+    zip.file(`Audio/Music/${musicName}`, wavBytes);
+  });
+
+  (project.audio.sfxEvents ?? []).forEach((sfx, idx) => {
+    const sfxName = `SFX_${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(sfx.category)}_${sanitizeFileName(sfx.label).slice(0, 20)}.wav`;
+    const wavBytes = generateSfxWav(sfx);
+    zip.file(`Audio/SFX/${sfxName}`, wavBytes);
+  });
+
+  if (project.audio.voiceoverDetected) {
+    if (project.motionGraphics.length > 0) {
+      project.motionGraphics.forEach((g, idx) => {
+        const clean = sanitizeFileName(g.text).slice(0, 20);
+        const voName = `VO_${String(idx + 1).padStart(2, '0')}_${clean}.wav`;
+        const wavBytes = generateVoiceoverCueWav(Math.max(0.3, g.endTimeSec - g.startTimeSec));
+        zip.file(`Audio/Voiceover/${voName}`, wavBytes);
+      });
+    } else {
+      const wavBytes = generateVoiceoverCueWav(project.metadata.durationSec);
+      zip.file(`Audio/Voiceover/VO_01_Full_Dialogue_Guide.wav`, wavBytes);
+    }
   }
 
   zip.file(
